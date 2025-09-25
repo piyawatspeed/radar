@@ -11,7 +11,8 @@
 ## Data Acquisition and Caching
 - Image discovery (`list_images`, `parse_timestamp`) and timestamp helpers convert between filename timestamps and `datetime` objects, enabling time-based neighbor lookups inside the dataset.【F:ddp.py†L210-L244】
 - RGB assets optionally flow through an `.npy`/`.npz` caching layer driven by `_rgb_cache_path` and `imread_rgb`. Timestamp-derived stems keep filenames stable across machines, caches are written atomically to avoid corruption, and operators can choose compressed (space-saving) or raw (fast I/O) modes.【F:ddp.py†L227-L294】
-- Weak label generation combines HSV thresholding, morphological cleanup, and configurable quantization/padding. `_weak_cache_key_base` now keys caches by the filename timestamp plus readable parameter tokens, while `_weak_cache_exists_only` and `get_weak_label_cached` enforce strict no-recompute semantics when desired.【F:ddp.py†L296-L509】
+- Weak label generation combines HSV thresholding, morphological cleanup, and configurable quantization/padding. `_weak_cache_key_base` derives a `WeakCacheKey` carrying the timestamp stem and parameter tokens so lookups can address either per-file caches or sharded backends.【F:ddp.py†L296-L509】【F:ddp.py†L598-L757】
+- `WeakCacheStore` bridges LMDB/Zarr/Parquet shards through a uniform interface. When a backend is configured (via `WEAK_CACHE_BACKEND`, `WEAK_CACHE_SHARD_BY`, and related environment toggles) weak-label reads flow through the shared store first and only fall back to legacy `.npz` files if a shard miss occurs.【F:ddp.py†L55-L111】【F:ddp.py†L598-L757】
 - Atlas building (`build_atlas_mask`, `_fit_mask_to`) summarizes static artifacts (e.g., radar occlusion regions) so downstream samples can zero out unusable pixels.【F:ddp.py†L537-L636】
 
 ## Dataset Pipeline
@@ -30,7 +31,7 @@
 - Validation leverages `_predict_tta` for optional test-time augmentation and aggregates metrics across distributed ranks with `weighted_reduce_sum_count`. Early stopping monitors validation loss and persists the best-performing state dict.【F:ddp.py†L1209-L1265】【F:ddp.py†L1265-L1337】
 
 ## CPU Preparation Stage
-- `stage_cpu_prep` collects radar sources, configures cache formats (e.g., enabling fast I/O via `--fast-io`), and optionally precomputes weak labels and RGB caches in parallel with a `ProcessPoolExecutor`. The stage reports cache coverage before and after processing and respects strict reuse modes that forbid recomputation.【F:ddp.py†L1339-L1525】
+- `stage_cpu_prep` collects radar sources, configures cache formats (e.g., enabling fast I/O via `--fast-io`), and optionally precomputes weak labels and RGB caches in parallel with a `ProcessPoolExecutor`. When the shared store is active the workers insert freshly computed masks into the configured shard (e.g., day-buckets) so subsequent runs can reuse them without touching individual `.npz` files. Coverage reporting still reflects both store hits and disk artifacts, and strict reuse modes continue to forbid recomputation.【F:ddp.py†L1339-L1525】【F:ddp.py†L598-L757】
 
 ## GPU / DDP Training Stage
 - `stage_gpu_train` initializes distributed state, validates cache availability when strict modes are enabled, assembles loaders, and finally delegates to `run_training` with the currently active hyperparameter defaults. Cleanup ensures process groups and GPU memory are released at the end of the run.【F:ddp.py†L1527-L1605】
@@ -38,4 +39,4 @@
 ## Command-Line Interface
 - `parse_args` enumerates user-facing toggles for both stages, including cache policies, worker configuration, strictness flags, and paths. `main` applies overrides (e.g., updating global directories), selects the requested stage, and invokes the corresponding driver.【F:ddp.py†L1607-L1716】
 
-This architecture keeps preprocessing and training in a single script while modularizing concerns—caching, dataset assembly, modeling, optimization, and distributed execution—so operators can switch between space-saving and performance-oriented workflows without modifying source code.
+This architecture keeps preprocessing and training in a single script while modularizing concerns—caching, dataset assembly, modeling, optimization, and distributed execution—so operators can switch between space-saving and performance-oriented workflows without modifying source code. Sharded weak-label storage extends those trade-offs, letting deployments choose between per-file caches and scalable shared stores by flipping environment variables rather than rewriting pipelines.【F:ddp.py†L55-L111】【F:ddp.py†L598-L757】
