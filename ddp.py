@@ -19,7 +19,7 @@
 #   train (strict):  python ddp.py --stage gpu-train --strict-cache-only --strict-atlas-only --radar-dirs /path/njk,/path/nkm --cache-root /big/cache
 
 from __future__ import annotations
-import os, re, glob, math, time, random, json, gc, contextlib, hashlib, bisect, argparse
+import os, re, glob, math, time, random, gc, contextlib, bisect, argparse
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timedelta
@@ -222,34 +222,34 @@ def add_minutes(ts: int, minutes: int) -> int: return dt_to_ts(ts_to_dt(ts) + ti
 
 def ensure_dir(d: str):
     if d: os.makedirs(d, exist_ok=True)
-def _stable_file_id(path: str) -> str:
-    """Machine-agnostic fingerprint for a file: size + first/last 256KB."""
-    try:
-        st = os.stat(path)
-        size = int(st.st_size)
-        h = hashlib.md5()
-        with open(path, "rb") as f:
-            chunk = f.read(256 * 1024)
-            h.update(chunk)
-            if size > 256 * 1024:
-                f.seek(max(0, size - 256 * 1024))
-                h.update(f.read(256 * 1024))
-        h.update(str(size).encode())
-        return h.hexdigest()[:10]
-    except Exception:
-        try:
-            size = os.path.getsize(path)
-        except Exception:
-            size = 0
-        return hashlib.md5((os.path.basename(path) + str(size)).encode()).hexdigest()[:10]
 
+
+def _image_timestamp_token(path: str) -> str:
+    """Derive a stable token from the filename timestamp (fallback to basename)."""
+    ts = parse_timestamp(path)
+    if ts is not None:
+        return str(ts)
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _tokenize_value(value) -> str:
+    if isinstance(value, float):
+        token = format(value, ".6g")
+        if token.endswith(".0"):
+            token = token[:-2]
+    else:
+        token = str(value)
+    token = token.replace(".", "p").replace("-", "m")
+    token = re.sub(r"[^A-Za-z0-9]+", "-", token).strip("-")
+    return token or "0"
 
 
 def _rgb_cache_path(path: str) -> str:
     base = os.path.splitext(os.path.basename(path))[0]
-    h = _stable_file_id(path)
+    token = _image_timestamp_token(path)
+    stem = base if token in base else f"{base}.{token}"
     ext = ".npy" if RGB_CACHE_MODE == "npy" else ".npz"
-    return os.path.join(RGB_CACHE_DIR, f"{base}.{h}{ext}")
+    return os.path.join(RGB_CACHE_DIR, f"{stem}{ext}")
 
 def _atomic_write(target_path: str, writer_fn):
     tmp_dir = os.path.dirname(target_path) or "."
@@ -295,16 +295,18 @@ def imread_rgb(path: str) -> np.ndarray:
 
 # --------- Weak-label compressed cache (.npz with bit-packed mask + float16 inten) ----------
 def _weak_cache_key_base(path: str, hsvp, left_mask_px: int) -> str:
-    fid = _stable_file_id(path)
-    sig = {
-        "fid": fid,
-        "mode": WEAK_LABEL_MODE,
-        "hsvp": dict(h_lo=hsvp.hue_lo, h_hi=hsvp.hue_hi, s=HSV_S_MIN, v=HSV_V_MIN),
-        "left": left_mask_px,
-    }
-    h = hashlib.md5(json.dumps(sig, sort_keys=True).encode()).hexdigest()
     base = os.path.splitext(os.path.basename(path))[0]
-    return os.path.join(CACHE_DIR, f"{base}.{h}.weak")
+    token = _image_timestamp_token(path)
+    stem = base if token in base else f"{base}.{token}"
+    params = [
+        f"mode-{_tokenize_value(WEAK_LABEL_MODE)}",
+        f"h-{_tokenize_value(hsvp.hue_lo)}-{_tokenize_value(hsvp.hue_hi)}",
+        f"s-{_tokenize_value(hsvp.sat_min)}",
+        f"v-{_tokenize_value(hsvp.val_min)}",
+        f"left-{_tokenize_value(left_mask_px)}",
+    ]
+    param_str = ".".join(params)
+    return os.path.join(CACHE_DIR, f"{stem}.{param_str}.weak")
 
 
 def _weak_paths(base: str):
@@ -428,11 +430,13 @@ def _morph_open_close_torch(mask_np: np.ndarray, k: int = 3, device: str = "cpu"
 def _weak_label_core(img_rgb: np.ndarray, hsvp: HSVParams, left_mask_px: int):
     Hh, S, V = rgb_to_hsv_np(img_rgb).transpose(2,0,1)
     H, W = Hh.shape
+    sat_min = hsvp.sat_min
+    val_min = hsvp.val_min
     if WEAK_LABEL_MODE == "hsv_multi":
         ranges = _union_hue_ranges(Hh, HSV_MULTI_RANGES)
         mask = np.zeros((H, W), dtype=bool); inten = np.zeros((H, W), dtype=np.float32)
         for lo, hi, a, b in ranges:
-            rng = _in_hue_range(Hh, lo, hi) & (S >= HSV_S_MIN) & (V >= HSV_V_MIN)
+            rng = _in_hue_range(Hh, lo, hi) & (S >= sat_min) & (V >= val_min)
             mask |= rng
             width = (hi - lo) if hi >= lo else (1.0 - lo + hi)
             pos = np.where(hi >= lo, (Hh - lo) / (width + 1e-6),
@@ -440,7 +444,7 @@ def _weak_label_core(img_rgb: np.ndarray, hsvp: HSVParams, left_mask_px: int):
             inten[rng] = (a + pos[rng] * (b - a)).astype(np.float32)
     else:
         hue_lo = hsvp.hue_lo; hue_hi = hsvp.hue_hi
-        mask = (Hh >= hue_lo) & (Hh <= hue_hi) & (S >= HSV_S_MIN) & (V >= HSV_V_MIN)
+        mask = (Hh >= hue_lo) & (Hh <= hue_hi) & (S >= sat_min) & (V >= val_min)
         inten = np.clip((Hh - hue_lo) / max(1e-6, (hue_hi - hue_lo)), 0.0, 1.0).astype(np.float32)
         inten[~mask] = 0.0
     if left_mask_px > 0:
@@ -678,17 +682,19 @@ class TwoRadarFusionDataset(Dataset):
         ts_list = s.ts_sorted
         i = bisect.bisect_left(ts_list, target_ts)
         best_t, best_dt = None, float("inf")
+        n = len(ts_list)
         for off in range(0, 8):
+            any_within = False
             idxs = (i - off, i + off) if off > 0 else (i,)
             for j in idxs:
-                if 0 <= j < len(ts_list):
+                if 0 <= j < n:
                     t = ts_list[j]
                     dtmin = abs((ts_to_dt(t) - ts_to_dt(target_ts)).total_seconds() / 60.0)
-                    if dtmin <= tol_min and dtmin < best_dt:
-                        best_dt, best_t = dtmin, t
-            left_ok  = (i - off) >= 0 and abs((ts_to_dt(ts_list[i - off]) - ts_to_dt(target_ts)).total_seconds()/60.0) <= tol_min
-            right_ok = (i + off) < len(ts_list) and abs((ts_to_dt(ts_list[i + off]) - ts_to_dt(target_ts)).total_seconds()/60.0) <= tol_min
-            if off > 0 and not left_ok and not right_ok:
+                    if dtmin <= tol_min:
+                        any_within = True
+                        if dtmin < best_dt:
+                            best_dt, best_t = dtmin, t
+            if off > 0 and not any_within:
                 break
         return best_t
 
@@ -751,8 +757,9 @@ class TwoRadarFusionDataset(Dataset):
                     m, inten = get_weak_label_cached(path, self.dcfg.hsv, self.dcfg.left_mask_px)
                     pairs.append((m, inten)); present_flags.append(1.0)
 
+        crop_sz = max(1, int(self.dcfg.crop))
         shapes = [p[0].shape for p in pairs if p is not None]
-        H, W = (CROP, CROP) if len(shapes) == 0 else (max(s[0] for s in shapes), max(s[1] for s in shapes))
+        H, W = (crop_sz, crop_sz) if len(shapes) == 0 else (max(s[0] for s in shapes), max(s[1] for s in shapes))
 
         def to_hw(pair):
             if pair is None:
@@ -805,12 +812,12 @@ class TwoRadarFusionDataset(Dataset):
         y_mask = self._apply_view(y_mask.astype(np.float32), view) > 0.5
         y_dbz  = self._apply_view(y_dbz, view)
 
-        def pad_min(a): return self._pad_to(a, max(CROP, a.shape[0]), max(CROP, a.shape[1]))
+        def pad_min(a): return self._pad_to(a, max(crop_sz, a.shape[0]), max(crop_sz, a.shape[1]))
         chs = [pad_min(a) for a in chs]
         y_mask = pad_min(y_mask.astype(np.float32)) > 0.5
         y_dbz  = pad_min(y_dbz)
 
-        crop = self.dcfg.crop
+        crop = crop_sz
         y0, x0 = self._choose_crop(chs, y_mask.astype(np.float32), crop)
         chs = [a[y0:y0+crop, x0:x0+crop] for a in chs]
         y_mask = y_mask[y0:y0+crop, x0:x0+crop]
@@ -961,7 +968,7 @@ def _make_bar(loader, desc, rank):
 # ===========================
 def lr_range_test(model, train_loader, device, loss_focal, steps=LR_FINDER_STEPS, lr_min=LR_MIN, lr_max=LR_MAX,
                   AMP_ENABLED=False, amp_dtype=None, amp_ctx=contextlib.nullcontext, scaler=None, pin=False,
-                  time_limit=LR_FINDER_TIME_LIMIT_SEC):
+                  time_limit=LR_FINDER_TIME_LIMIT_SEC, dice_weight=DICE_WEIGHT, lambda_dbz=LAMBDA_DBZ):
     model.train()
     tmp_opt = torch.optim.AdamW(model.parameters(), lr=lr_min, weight_decay=WEIGHT_DECAY)
     num = min(int(steps), int(LR_FINDER_MAX_STEPS))
@@ -977,12 +984,12 @@ def lr_range_test(model, train_loader, device, loss_focal, steps=LR_FINDER_STEPS
         tmp_opt.zero_grad(set_to_none=True)
         with amp_ctx():
             logits, dbz_pred = model(x)
-            loss_mask = loss_focal(logits, y_mask) + DICE_WEIGHT * dice_loss(logits, y_mask)
+            loss_mask = loss_focal(logits, y_mask) + dice_weight * dice_loss(logits, y_mask)
             gate = (y_mask > 0.5).float()
             l1_all = F.smooth_l1_loss(dbz_pred, y_dbz, reduction="none")
             pos = gate.sum()
             loss_dbz = (l1_all * gate).sum() / (pos + 1e-6)
-            loss = loss_mask + LAMBDA_DBZ * loss_dbz
+            loss = loss_mask + lambda_dbz * loss_dbz
         if AMP_ENABLED:
             scaler.scale(loss).backward(); scaler.step(tmp_opt); scaler.update()
         else:
@@ -1013,7 +1020,11 @@ def _predict_tta(model, x, do_tta: bool):
 
 def bcast_float_from0(val: float) -> float:
     if not ddp_is_dist(): return val
-    t = torch.tensor([val], device="cuda")
+    if torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device("cpu")
+    t = torch.tensor([val], device=device)
     dist.broadcast(t, src=0)
     return t.item()
 
@@ -1098,8 +1109,10 @@ def run_training(hparams, device, rank, local_rank, world_size,
         try: model = torch.compile(model)
         except Exception: pass
     if ddp_is_dist():
-        model = nn.parallel.DistributedDataParallel(
-            model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        ddp_kwargs = dict(find_unused_parameters=False)
+        if device.type == "cuda":
+            ddp_kwargs.update(device_ids=[local_rank], output_device=local_rank)
+        model = nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
 
     loss_focal = FocalBCE(alpha=focal_alpha, gamma=focal_gamma)
 
@@ -1119,7 +1132,8 @@ def run_training(hparams, device, rank, local_rank, world_size,
                                     lr_min=hparams.get("lr_min", LR_MIN),
                                     lr_max=hparams.get("lr_max", LR_MAX),
                                     AMP_ENABLED=AMP_ENABLED, amp_ctx=amp_ctx, scaler=scaler, pin=False,
-                                    time_limit=LR_FINDER_TIME_LIMIT_SEC)
+                                    time_limit=LR_FINDER_TIME_LIMIT_SEC, dice_weight=dice_w,
+                                    lambda_dbz=lambda_dbz)
             del model_copy; gc.collect()
             if device.type == "cuda": torch.cuda.empty_cache()
         else:
@@ -1155,7 +1169,7 @@ def run_training(hparams, device, rank, local_rank, world_size,
             sched = SequentialLR(opt, schedulers=[warm, cos], milestones=[warmup_steps_effective])
         else:
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, total_opt_steps))
-        if USE_SWA and scheduler_kind == "cosine":
+        if use_swa:
             from torch.optim.swa_utils import AveragedModel, SWALR
             base_module = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
             swa_model = AveragedModel(base_module)
@@ -1184,6 +1198,26 @@ def run_training(hparams, device, rank, local_rank, world_size,
         bar = _make_bar(train_loader, f"Train e{epoch}", rank)
         opt.zero_grad(set_to_none=True)
 
+        steps_processed = 0
+
+        def optimizer_step():
+            if device.type == "cuda":
+                if grad_clip is not None:
+                    scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                if grad_clip is not None:
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                opt.step()
+            opt.zero_grad(set_to_none=True)
+            if scheduler_kind in ("onecycle", "cosine") and sched is not None:
+                sched.step()
+            if ema is not None:
+                base_module = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
+                ema.update(base_module)
+
         for step, batch in enumerate(bar, 1):
             iter_t0 = time.time()
             x = batch["x"].to(device, non_blocking=(device.type=="cuda")).contiguous(memory_format=torch.channels_last)
@@ -1193,7 +1227,7 @@ def run_training(hparams, device, rank, local_rank, world_size,
 
             with (torch.amp.autocast("cuda", dtype=(torch.bfloat16 if (device.type=="cuda" and torch.cuda.is_bf16_supported()) else torch.float16), enabled=(device.type=="cuda" and MIXED_PRECISION)) if device.type=="cuda" else contextlib.nullcontext()):
                 logits, dbz_pred = model(x)
-                loss_mask = FocalBCE(alpha=focal_alpha, gamma=focal_gamma)(logits, y_mask) + dice_w * dice_loss(logits, y_mask)
+                loss_mask = loss_focal(logits, y_mask) + dice_w * dice_loss(logits, y_mask)
                 gate = (y_mask_raw > 0.5).float()
                 l1 = F.smooth_l1_loss(dbz_pred, y_dbz, reduction="none")
                 pos = gate.sum()
@@ -1205,21 +1239,10 @@ def run_training(hparams, device, rank, local_rank, world_size,
             else:
                 loss.backward()
 
+            steps_processed = step
+
             if step % grad_accum == 0:
-                if device.type == "cuda":
-                    if GRAD_CLIP_NORM is not None:
-                        scaler.unscale_(opt); nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_NORM)
-                    scaler.step(opt); scaler.update()
-                else:
-                    if GRAD_CLIP_NORM is not None:
-                        nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_NORM)
-                    opt.step()
-                opt.zero_grad(set_to_none=True)
-                if scheduler_kind in ("onecycle", "cosine"):
-                    sched.step()
-                if ema is not None:
-                    base_module = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
-                    ema.update(base_module)
+                optimizer_step()
 
             running = (0.98 * running + 0.02 * float((loss * grad_accum).item())) if step > 1 else float((loss * grad_accum).item())
 
@@ -1230,6 +1253,9 @@ def run_training(hparams, device, rank, local_rank, world_size,
                 dt = max(1e-6, time.time() - iter_t0)
                 ips = global_bsz / dt
                 bar.set_postfix(loss=f"{running:.4f}", lr=f"{cur_lr:.2e}", ips=f"{ips:.1f}/s", mem=f"{mem_alloc:.2f}G|{mem_peak:.2f}G")
+
+        if (steps_processed % grad_accum) != 0:
+            optimizer_step()
 
         if (scheduler_kind == "cosine") and (swa_model is not None) and (epoch >= int(max(1, epochs * SWA_START_FRAC))):
             base_module = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
@@ -1260,7 +1286,7 @@ def run_training(hparams, device, rank, local_rank, world_size,
                             logits, dbz_pred = _predict_tta(m, x, do_tta=do_tta)
                     else:
                         logits, dbz_pred = _predict_tta(m, x, do_tta=do_tta)
-                    loss_mask = FocalBCE(alpha=focal_alpha, gamma=focal_gamma)(logits, y_mask) + dice_w * dice_loss(logits, y_mask)
+                    loss_mask = loss_focal(logits, y_mask) + dice_w * dice_loss(logits, y_mask)
                     gate = (y_mask_raw > 0.5).float()
                     l1 = F.smooth_l1_loss(dbz_pred, y_dbz, reduction="none")
                     pos = gate.sum()
