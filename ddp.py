@@ -19,9 +19,9 @@
 #   train (strict):  python ddp.py --stage gpu-train --strict-cache-only --strict-atlas-only --radar-dirs /path/njk,/path/nkm --cache-root /big/cache
 
 from __future__ import annotations
-import os, re, glob, math, time, random, gc, contextlib, bisect, argparse
+import os, re, glob, math, time, random, gc, contextlib, bisect, argparse, io, hashlib
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Iterable, Any
 from datetime import datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -61,6 +61,14 @@ CACHE_DIR = os.path.join(CACHE_ROOT, "cache")             # weak-label/atlas cac
 RGB_CACHE_DIR = os.path.join(CACHE_ROOT, "img_npy_cache") # RGB caches
 for _d in [WORK_DIR, CACHE_DIR, RGB_CACHE_DIR]:
     os.makedirs(_d, exist_ok=True)
+
+# Weak-cache sharding / shared store configuration
+WEAK_CACHE_BACKEND = os.environ.get("WEAK_CACHE_BACKEND", "").strip().lower() or None
+WEAK_CACHE_SHARD_BY = os.environ.get("WEAK_CACHE_SHARD_BY", "day").strip().lower()
+try:
+    WEAK_CACHE_LMDB_MAP_SIZE = int(os.environ.get("WEAK_CACHE_LMDB_MAP_SIZE", str(1 << 34)))
+except ValueError:
+    WEAK_CACHE_LMDB_MAP_SIZE = 1 << 34
 
 # RGB caching: "off" | "npy" | "npz"
 RGB_CACHE_MODE = "off"   # will be set to "npy" during cpu-prep when --fast-io/--do-rgb-cache
@@ -297,22 +305,88 @@ def imread_rgb(path: str) -> np.ndarray:
     return arr
 
 # --------- Weak-label compressed cache (.npz with bit-packed mask + float16 inten) ----------
-def _weak_cache_key_base(path: str, hsvp, left_mask_px: int) -> str:
+@dataclass(frozen=True)
+class WeakCacheKey:
+    stem: str
+    param_tokens: Tuple[str, ...]
+    base_path: str
+
+    @property
+    def param_str(self) -> str:
+        return ".".join(self.param_tokens)
+
+    @property
+    def signature(self) -> str:
+        return f"{self.stem}::{self.param_str}" if self.param_tokens else self.stem
+
+    def timestamp_token(self) -> Optional[str]:
+        m = re.search(r"\d{12}", self.stem)
+        return m.group(0) if m else None
+
+    def shard_key(self, shard_by: str = "day") -> str:
+        ts = self.timestamp_token()
+        if shard_by == "day" and ts:
+            return ts[:8]
+        if shard_by == "hour" and ts:
+            return ts[:10]
+        if shard_by == "month" and ts:
+            return ts[:6]
+        return ts or "misc"
+
+    @classmethod
+    def from_components(cls, stem: str, param_tokens: Iterable[str], cache_dir: str) -> "WeakCacheKey":
+        pt = tuple(param_tokens)
+        if pt:
+            param_str = ".".join(pt)
+            base_path = os.path.join(cache_dir, f"{stem}.{param_str}.weak")
+        else:
+            base_path = os.path.join(cache_dir, f"{stem}.weak")
+        return cls(stem=stem, param_tokens=pt, base_path=base_path)
+
+
+def _weak_cache_key_from_legacy_path(path: str, cache_dir: Optional[str] = None) -> WeakCacheKey:
+    fname = os.path.basename(path)
+    for suf in (".w.npz", ".mask.npy", ".inten.npy"):
+        if fname.endswith(suf):
+            fname = fname[:-len(suf)]
+            break
+    if fname.endswith(".weak"):
+        fname = fname[:-5]
+    stem = fname
+    params: Tuple[str, ...] = ()
+    marker = ".mode-"
+    if marker in fname:
+        idx = fname.index(marker)
+        stem = fname[:idx]
+        param_str = fname[idx + 1 :]
+        params = tuple(p for p in param_str.split(".") if p)
+    cache_dir = cache_dir or os.path.dirname(path) or CACHE_DIR
+    return WeakCacheKey.from_components(stem, params, cache_dir)
+
+
+def _weak_cache_key_base(path: str, hsvp, left_mask_px: int) -> WeakCacheKey:
     base = os.path.splitext(os.path.basename(path))[0]
     token = _image_timestamp_token(path)
     stem = base if token in base else f"{base}.{token}"
-    params = [
+    params = (
         f"mode-{_tokenize_value(WEAK_LABEL_MODE)}",
         f"h-{_tokenize_value(hsvp.hue_lo)}-{_tokenize_value(hsvp.hue_hi)}",
         f"s-{_tokenize_value(hsvp.sat_min)}",
         f"v-{_tokenize_value(hsvp.val_min)}",
         f"left-{_tokenize_value(left_mask_px)}",
-    ]
-    param_str = ".".join(params)
-    return os.path.join(CACHE_DIR, f"{stem}.{param_str}.weak")
+    )
+    key = WeakCacheKey.from_components(stem, params, CACHE_DIR)
+    store = get_weak_cache_store()
+    if store:
+        return store.normalize_key(key)
+    return key
 
 
-def _weak_paths(base: str):
+def _weak_paths(key: WeakCacheKey):
+    store = get_weak_cache_store()
+    if store:
+        return store.paths_for_key(key)
+    base = key.base_path
     w_npz = base + ".w.npz"
     m_npy = base + ".mask.npy"
     i_npy = base + ".inten.npy"
@@ -330,51 +404,291 @@ def _weak_fuzzy_candidates(path: str) -> List[str]:
     return cands
 
 
-def _save_weak_npz(path: str, mask: np.ndarray, inten: np.ndarray):
+def _weak_record_components(mask: np.ndarray, inten: np.ndarray):
     H, W = mask.shape
-    # Decide intensity payload
     iq8 = 1 if WEAK_INTEN_DTYPE is np.uint8 else 0
     if iq8:
         inten_disk = np.clip(np.rint(inten * 255.0), 0, 255).astype(np.uint8)
     else:
         inten_disk = inten.astype(WEAK_INTEN_DTYPE if WEAK_CACHE_COMPRESS else np.float32)
-
-    # Decide mask payload
     if WEAK_PACK_MASK_BITS:
-        packed = np.packbits(mask.astype(np.uint8), axis=1)
-        def _writer(p):
-            np.savez_compressed(
-                p,
-                shape=np.array([H, W], np.int32),
-                mask=packed,
-                inten=inten_disk,
-                iq8=np.array([iq8], np.uint8),
-            )
+        mask_payload = np.packbits(mask.astype(np.uint8), axis=1)
     else:
-        def _writer(p):
-            np.savez_compressed(
-                p,
-                shape=np.array([H, W], np.int32),
-                mask=mask.astype(np.uint8),
-                inten=inten_disk,
-                iq8=np.array([iq8], np.uint8),
+        mask_payload = mask.astype(np.uint8)
+    return {
+        "shape": np.array([H, W], np.int32),
+        "mask": mask_payload,
+        "inten": inten_disk,
+        "iq8": np.array([iq8], np.uint8),
+    }
+
+
+def _weak_record_to_bytes(mask: np.ndarray, inten: np.ndarray) -> bytes:
+    payload = _weak_record_components(mask, inten)
+    buf = io.BytesIO()
+    np.savez_compressed(buf, **payload)
+    return buf.getvalue()
+
+
+def _weak_record_from_arrays(z) -> Tuple[np.ndarray, np.ndarray]:
+    H, W = map(int, z["shape"])
+    m = z["mask"]
+    iq8 = int(z["iq8"][0]) if "iq8" in getattr(z, "files", z) else 0
+    if WEAK_PACK_MASK_BITS and m.ndim == 2:
+        mask = np.unpackbits(m, axis=1)[:, :W].astype(bool)
+    else:
+        mask = (m.astype(np.uint8) > 0)
+    inten_raw = z["inten"]
+    inten = (inten_raw.astype(np.float32) / 255.0) if iq8 else inten_raw.astype(np.float32)
+    return mask, inten
+
+
+def _weak_record_from_bytes(payload: bytes) -> Tuple[np.ndarray, np.ndarray]:
+    with np.load(io.BytesIO(payload)) as z:
+        return _weak_record_from_arrays(z)
+
+
+class _WeakCacheBackend:
+    def __init__(self, root: str):
+        self.root = root
+
+    def get(self, shard_id: str, store_key: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        raise NotImplementedError
+
+    def set(self, shard_id: str, store_key: str, mask: np.ndarray, inten: np.ndarray):
+        raise NotImplementedError
+
+    def exists(self, shard_id: str, store_key: str) -> bool:
+        raise NotImplementedError
+
+    def paths_for_key(self, key: WeakCacheKey) -> Tuple[str, str, str]:
+        base = key.base_path
+        return base + ".w.npz", base + ".mask.npy", base + ".inten.npy"
+
+    def close(self):
+        pass
+
+
+class _LMDBWeakCacheBackend(_WeakCacheBackend):
+    def __init__(self, root: str, map_size: int):
+        super().__init__(root)
+        try:
+            import lmdb  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("lmdb backend requested but python-lmdb is not installed") from exc
+        self._lmdb = lmdb
+        ensure_dir(root)
+        self._envs: Dict[str, Any] = {}
+        self._map_size = map_size
+
+    def _env(self, shard_id: str):
+        env = self._envs.get(shard_id)
+        if env is None:
+            path = os.path.join(self.root, f"{shard_id}.lmdb")
+            ensure_dir(os.path.dirname(path) or ".")
+            env = self._lmdb.open(path, map_size=self._map_size, subdir=True, create=True, lock=True, readahead=False)
+            self._envs[shard_id] = env
+        return env
+
+    def get(self, shard_id: str, store_key: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        env = self._env(shard_id)
+        with env.begin(write=False) as txn:
+            payload = txn.get(store_key.encode("utf-8"))
+        if not payload:
+            return None
+        return _weak_record_from_bytes(bytes(payload))
+
+    def set(self, shard_id: str, store_key: str, mask: np.ndarray, inten: np.ndarray):
+        env = self._env(shard_id)
+        payload = _weak_record_to_bytes(mask, inten)
+        with env.begin(write=True) as txn:
+            txn.put(store_key.encode("utf-8"), payload)
+
+    def exists(self, shard_id: str, store_key: str) -> bool:
+        env = self._env(shard_id)
+        with env.begin(write=False) as txn:
+            return txn.get(store_key.encode("utf-8")) is not None
+
+    def close(self):
+        for env in self._envs.values():
+            env.close()
+        self._envs.clear()
+
+
+class _ZarrWeakCacheBackend(_WeakCacheBackend):
+    def __init__(self, root: str):
+        super().__init__(root)
+        try:
+            import zarr  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("zarr backend requested but zarr is not installed") from exc
+        self._zarr = zarr
+        ensure_dir(root)
+        store = zarr.DirectoryStore(root)
+        self._root = zarr.group(store=store, overwrite=False)
+
+    def _group(self, shard_id: str):
+        return self._root.require_group(shard_id)
+
+    def get(self, shard_id: str, store_key: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        grp = self._group(shard_id)
+        if store_key not in grp:
+            return None
+        node = grp[store_key]
+        mask = node["mask"][...].astype(bool)
+        inten = node["inten"][...].astype(np.float32)
+        return mask, inten
+
+    def set(self, shard_id: str, store_key: str, mask: np.ndarray, inten: np.ndarray):
+        grp = self._group(shard_id)
+        node = grp.require_group(store_key)
+        if "mask" in node:
+            del node["mask"]
+        if "inten" in node:
+            del node["inten"]
+        node.create_dataset("mask", data=mask.astype(bool), chunks=True)
+        node.create_dataset("inten", data=inten.astype(np.float32), chunks=True)
+
+    def exists(self, shard_id: str, store_key: str) -> bool:
+        grp = self._group(shard_id)
+        return store_key in grp
+
+
+class _ParquetWeakCacheBackend(_WeakCacheBackend):
+    def __init__(self, root: str):
+        super().__init__(root)
+        try:
+            import pyarrow as pa  # type: ignore
+            import pyarrow.parquet as pq  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("parquet backend requested but pyarrow is not installed") from exc
+        self._pa = pa
+        self._pq = pq
+        ensure_dir(root)
+
+    def _key_path(self, shard_id: str, store_key: str) -> str:
+        ensure_dir(os.path.join(self.root, shard_id))
+        digest = hashlib.sha1(store_key.encode("utf-8")).hexdigest()
+        return os.path.join(self.root, shard_id, f"{digest}.parquet")
+
+    def get(self, shard_id: str, store_key: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        path = self._key_path(shard_id, store_key)
+        if not os.path.isfile(path):
+            return None
+        table = self._pq.read_table(path)
+        if table.num_rows == 0:
+            return None
+        payload = table.column("payload")[0].as_buffer().to_pybytes()
+        return _weak_record_from_bytes(payload)
+
+    def set(self, shard_id: str, store_key: str, mask: np.ndarray, inten: np.ndarray):
+        payload = _weak_record_to_bytes(mask, inten)
+        path = self._key_path(shard_id, store_key)
+        table = self._pa.table({
+            "key": self._pa.array([store_key]),
+            "payload": self._pa.array([self._pa.py_buffer(payload)], type=self._pa.binary()),
+        })
+        self._pq.write_table(table, path)
+
+    def exists(self, shard_id: str, store_key: str) -> bool:
+        path = self._key_path(shard_id, store_key)
+        return os.path.isfile(path)
+
+
+class WeakCacheStore:
+    """Shared weak-cache store supporting LMDB/Zarr/Parquet backends."""
+
+    def __init__(self, root: str, backend: Optional[str], shard_by: str = "day", lmdb_map_size: int = 1 << 34):
+        backend = (backend or "").strip().lower()
+        self.enabled = bool(backend)
+        self.root = os.path.join(root, "weak_shards")
+        self.backend_name = backend
+        self.shard_by = shard_by
+        self._backend: Optional[_WeakCacheBackend] = None
+        if not self.enabled:
+            return
+        ensure_dir(self.root)
+        if backend == "lmdb":
+            self._backend = _LMDBWeakCacheBackend(self.root, map_size=lmdb_map_size)
+        elif backend == "zarr":
+            self._backend = _ZarrWeakCacheBackend(self.root)
+        elif backend == "parquet":
+            self._backend = _ParquetWeakCacheBackend(self.root)
+        else:
+            raise ValueError(f"Unsupported weak-cache backend: {backend}")
+
+    def close(self):
+        if self._backend:
+            self._backend.close()
+
+    def normalize_key(self, key: WeakCacheKey) -> WeakCacheKey:
+        # Hook for future customization (e.g., slugify stem). Currently no-op.
+        return key
+
+    def paths_for_key(self, key: WeakCacheKey) -> Tuple[str, str, str]:
+        if self._backend:
+            return self._backend.paths_for_key(key)
+        base = key.base_path
+        return base + ".w.npz", base + ".mask.npy", base + ".inten.npy"
+
+    def _store_key(self, key: WeakCacheKey) -> str:
+        return key.signature
+
+    def _shard_id(self, key: WeakCacheKey) -> str:
+        return key.shard_key(self.shard_by)
+
+    def get(self, key: WeakCacheKey) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        if not (self.enabled and self._backend):
+            return None
+        shard = self._shard_id(key)
+        return self._backend.get(shard, self._store_key(key))
+
+    def set(self, key: WeakCacheKey, mask: np.ndarray, inten: np.ndarray):
+        if not (self.enabled and self._backend):
+            return
+        shard = self._shard_id(key)
+        self._backend.set(shard, self._store_key(key), mask, inten)
+
+    def exists(self, key: WeakCacheKey) -> bool:
+        if not (self.enabled and self._backend):
+            return False
+        shard = self._shard_id(key)
+        return self._backend.exists(shard, self._store_key(key))
+
+
+_WEAK_CACHE_STORE: Optional[WeakCacheStore] = None
+
+
+def get_weak_cache_store() -> Optional[WeakCacheStore]:
+    global _WEAK_CACHE_STORE
+    if _WEAK_CACHE_STORE is not None:
+        return _WEAK_CACHE_STORE if _WEAK_CACHE_STORE.enabled else None
+    if WEAK_CACHE_BACKEND:
+        try:
+            _WEAK_CACHE_STORE = WeakCacheStore(
+                CACHE_DIR,
+                backend=WEAK_CACHE_BACKEND,
+                shard_by=WEAK_CACHE_SHARD_BY,
+                lmdb_map_size=WEAK_CACHE_LMDB_MAP_SIZE,
             )
+        except Exception as exc:
+            print(f"⚠️ Weak-cache store init failed: {exc}", flush=True)
+            _WEAK_CACHE_STORE = None
+    else:
+        _WEAK_CACHE_STORE = None
+    return _WEAK_CACHE_STORE if (_WEAK_CACHE_STORE and _WEAK_CACHE_STORE.enabled) else None
+
+def _save_weak_npz(path: str, mask: np.ndarray, inten: np.ndarray):
+    payload = _weak_record_components(mask, inten)
+
+    def _writer(p):
+        np.savez_compressed(p, **payload)
+
     _atomic_write(path, _writer)
 
 def _load_weak_npz(path: str) -> Tuple[np.ndarray, np.ndarray]:
     with np.load(path) as z:
-        H, W = map(int, z["shape"])
-        m = z["mask"]
-        iq8 = int(z["iq8"][0]) if "iq8" in z.files else 0
-
-        if WEAK_PACK_MASK_BITS and m.ndim == 2:
-            mask = np.unpackbits(m, axis=1)[:, :W].astype(bool)
-        else:
-            mask = (m.astype(np.uint8) > 0)
-
-        inten_raw = z["inten"]
-        inten = (inten_raw.astype(np.float32) / 255.0) if iq8 else inten_raw.astype(np.float32)
-    return mask, inten
+        return _weak_record_from_arrays(z)
 
 
 # ===========================
@@ -512,8 +826,11 @@ def _weak_label_core(img_rgb: np.ndarray, hsvp: HSVParams, left_mask_px: int, de
     return mask_np, inten_np
 
 def _weak_cache_exists_only(path: str, hsvp: HSVParams, left_mask_px: int) -> bool:
-    base = _weak_cache_key_base(path, hsvp, left_mask_px)
-    w_npz, m_npy, i_npy = _weak_paths(base)
+    key = _weak_cache_key_base(path, hsvp, left_mask_px)
+    store = get_weak_cache_store()
+    if store and store.exists(key):
+        return True
+    w_npz, m_npy, i_npy = _weak_paths(key)
     if os.path.isfile(w_npz) or (os.path.isfile(m_npy) and os.path.isfile(i_npy)):
         return True
     if WEAK_CACHE_FUZZY_READ:
@@ -522,13 +839,22 @@ def _weak_cache_exists_only(path: str, hsvp: HSVParams, left_mask_px: int) -> bo
     return False
 
 def get_weak_label_cached(path: str, hsvp: HSVParams, left_mask_px: int = LEFT_MASK_PX, device: Optional[str] = None):
-    base = _weak_cache_key_base(path, hsvp, left_mask_px)
-    w_npz, m_npy, i_npy = _weak_paths(base)
+    key = _weak_cache_key_base(path, hsvp, left_mask_px)
+    store = get_weak_cache_store()
+    if store:
+        data = store.get(key)
+        if data is not None:
+            return data
+    w_npz, m_npy, i_npy = _weak_paths(key)
 
     # Reuse if present
     if os.path.isfile(w_npz):
         try:
-            return _load_weak_npz(w_npz)
+            data = _load_weak_npz(w_npz)
+            if store:
+                try: store.set(key, *data)
+                except Exception: pass
+            return data
         except Exception:
             pass
 
@@ -541,6 +867,9 @@ def get_weak_label_cached(path: str, hsvp: HSVParams, left_mask_px: int = LEFT_M
                     _save_weak_npz(w_npz, m, inten)
                 except Exception:
                     pass
+            if store:
+                try: store.set(key, m, inten)
+                except Exception: pass
             return m, inten
         except Exception:
             pass
@@ -550,7 +879,11 @@ def get_weak_label_cached(path: str, hsvp: HSVParams, left_mask_px: int = LEFT_M
         cands = _weak_fuzzy_candidates(path)
         for cp in cands:
             try:
-                return _load_weak_npz(cp)
+                data = _load_weak_npz(cp)
+                if store:
+                    try: store.set(key, *data)
+                    except Exception: pass
+                return data
             except Exception:
                 continue
 
@@ -567,6 +900,9 @@ def get_weak_label_cached(path: str, hsvp: HSVParams, left_mask_px: int = LEFT_M
     if device_str != "cpu" and not torch.cuda.is_available():
         device_str = "cpu"
     m, inten = _weak_label_core(img, hsvp, left_mask_px, device=device_str)
+    if store:
+        try: store.set(key, m, inten)
+        except Exception: pass
     if WEAK_CACHE_COMPRESS:
         try: _save_weak_npz(w_npz, m, inten)
         except Exception: pass
@@ -1443,17 +1779,32 @@ def _init_worker(omp_threads: int = 1):
 def _prep_single(path: str, left_mask_px: int, hsvp: HSVParams, do_rgb: bool, device: str):
     # Compute & write weak-label cache; optionally write RGB cache
     # NOTE: STRICT_CACHE_ONLY is ignored in cpu-prep; we always compute here.
-    base = _weak_cache_key_base(path, hsvp, left_mask_px)
-    w_npz, m_npy, i_npy = _weak_paths(base)
+    key = _weak_cache_key_base(path, hsvp, left_mask_px)
+    store = get_weak_cache_store()
+    w_npz, m_npy, i_npy = _weak_paths(key)
     # Only recompute if truly missing
-    if not (os.path.isfile(w_npz) or (os.path.isfile(m_npy) and os.path.isfile(i_npy))):
+    have_disk = os.path.isfile(w_npz) or (os.path.isfile(m_npy) and os.path.isfile(i_npy))
+    if not have_disk:
         img = imread_rgb(path)
         m, inten = _weak_label_core(img, hsvp, left_mask_px, device=device)
+        if store:
+            try: store.set(key, m, inten)
+            except Exception: pass
         if WEAK_CACHE_COMPRESS:
             _save_weak_npz(w_npz, m, inten)
         else:
             np.save(m_npy, m.astype(np.uint8))
             np.save(i_npy, inten.astype(np.float32))
+    elif store and not store.exists(key):
+        try:
+            if os.path.isfile(w_npz):
+                m, inten = _load_weak_npz(w_npz)
+            else:
+                m = np.load(m_npy, mmap_mode="r").astype(bool)
+                inten = np.load(i_npy, mmap_mode="r").astype(np.float32)
+            store.set(key, m, inten)
+        except Exception:
+            pass
     if do_rgb and (RGB_CACHE_MODE != "off"):
         _ = imread_rgb(path)  # will write if missing
     return os.path.basename(path)
