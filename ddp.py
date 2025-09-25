@@ -74,6 +74,9 @@ WEAK_PACK_MASK_BITS = True
 STRICT_CACHE_ONLY = False   # forbid weak-label recompute in gpu-train
 STRICT_ATLAS_ONLY = False   # forbid atlas rebuild if cache missing
 
+# Weak-label device (CPU default; toggled by CLI)
+WEAK_LABEL_DEVICE = "cpu"
+
 # ---- Weak-cache key/lookup robustness ----
 WEAK_KEY_IGNORE_MTIME = True      # ignore file mtime in cache key (prevents drift)
 WEAK_CACHE_FUZZY_READ = True      # if exact key not found, reuse any *.weak.w.npz for same basename
@@ -412,49 +415,101 @@ def _union_hue_ranges(H, ranges):
 def _in_hue_range(H, lo, hi):
     return (H >= lo) & (H <= hi) if hi >= lo else ((H >= lo) | (H <= hi))
 
-def _morph_open_close_torch(mask_np: np.ndarray, k: int = 3, device: str = "cpu") -> np.ndarray:
-    x = torch.from_numpy(mask_np.astype(np.float32))[None,None,:,:].to(device)
-    kernel = torch.ones((1,1,k,k), device=device)
-    pad = k//2
+def _morph_open_close_torch(mask_in, k: int = 3, device: str = "cpu") -> torch.Tensor:
+    use_cuda = device is not None and str(device).startswith("cuda") and torch.cuda.is_available()
+    dev = torch.device(device) if use_cuda else torch.device("cpu")
+
+    if isinstance(mask_in, torch.Tensor):
+        x = mask_in.to(dev)
+    else:
+        x = torch.as_tensor(mask_in, dtype=torch.float32, device=dev)
+
+    if x.ndim == 2:
+        x = x.unsqueeze(0).unsqueeze(0)
+    elif x.ndim == 3:
+        x = x.unsqueeze(0)
+
+    x = x.float()
+    kernel = torch.ones((1, 1, k, k), device=dev, dtype=x.dtype)
+    pad = k // 2
+
     hit = F.conv2d(x, kernel, padding=pad)
-    eroded = (hit >= (k*k) - 1e-6).float()
+    eroded = (hit >= (k * k) - 1e-6).float()
     hit2 = F.conv2d(eroded, kernel, padding=pad)
     opened = (hit2 > 1e-6).float()
     hit3 = F.conv2d(opened, kernel, padding=pad)
     dilated = (hit3 > 1e-6).float()
     hit4 = F.conv2d(dilated, kernel, padding=pad)
-    closed = (hit4 >= (k*k) - 1e-6).float()
-    out = (closed > 0.5).squeeze().detach().cpu().numpy().astype(bool)
-    return out
+    closed = (hit4 >= (k * k) - 1e-6)
+    return closed.squeeze(0).squeeze(0).to(dtype=torch.bool)
 
-def _weak_label_core(img_rgb: np.ndarray, hsvp: HSVParams, left_mask_px: int):
-    Hh, S, V = rgb_to_hsv_np(img_rgb).transpose(2,0,1)
-    H, W = Hh.shape
-    sat_min = hsvp.sat_min
-    val_min = hsvp.val_min
-    if WEAK_LABEL_MODE == "hsv_multi":
-        ranges = _union_hue_ranges(Hh, HSV_MULTI_RANGES)
-        mask = np.zeros((H, W), dtype=bool); inten = np.zeros((H, W), dtype=np.float32)
-        for lo, hi, a, b in ranges:
-            rng = _in_hue_range(Hh, lo, hi) & (S >= sat_min) & (V >= val_min)
-            mask |= rng
-            width = (hi - lo) if hi >= lo else (1.0 - lo + hi)
-            pos = np.where(hi >= lo, (Hh - lo) / (width + 1e-6),
-                           np.where(Hh >= lo, (Hh - lo) / (width + 1e-6), (Hh + 1.0 - lo) / (width + 1e-6)))
-            inten[rng] = (a + pos[rng] * (b - a)).astype(np.float32)
-    else:
-        hue_lo = hsvp.hue_lo; hue_hi = hsvp.hue_hi
-        mask = (Hh >= hue_lo) & (Hh <= hue_hi) & (S >= sat_min) & (V >= val_min)
-        inten = np.clip((Hh - hue_lo) / max(1e-6, (hue_hi - hue_lo)), 0.0, 1.0).astype(np.float32)
-        inten[~mask] = 0.0
+def _weak_label_core(img_rgb: np.ndarray, hsvp: HSVParams, left_mask_px: int, device: str = "cpu"):
+    use_cuda = device is not None and str(device).startswith("cuda") and torch.cuda.is_available()
+    dev = torch.device(device) if use_cuda else torch.device("cpu")
+
+    arr = torch.as_tensor(img_rgb, dtype=torch.float32, device=dev) / 255.0
+    eps = 1e-6
+
+    amp_ctx = torch.cuda.amp.autocast(dtype=torch.float16) if dev.type == "cuda" else contextlib.nullcontext()
+    with amp_ctx:
+        r, g, b = arr.unbind(dim=-1)
+        mx = arr.max(dim=-1).values
+        mn = arr.min(dim=-1).values
+        diff = mx - mn
+        mask_nz = diff > eps
+
+        h = torch.zeros_like(mx)
+        denom = diff + eps
+        h = torch.where(mask_nz & (mx == r), torch.remainder((g - b) / denom, 6.0), h)
+        h = torch.where(mask_nz & (mx == g), ((b - r) / denom) + 2.0, h)
+        h = torch.where(mask_nz & (mx == b), ((r - g) / denom) + 4.0, h)
+        h = torch.remainder(h / 6.0, 1.0)
+
+        s = torch.where(mx > eps, diff / (mx + eps), torch.zeros_like(mx))
+        v = mx
+
+        sat_min = float(hsvp.sat_min)
+        val_min = float(hsvp.val_min)
+
+        if WEAK_LABEL_MODE == "hsv_multi":
+            ranges = _union_hue_ranges(None, HSV_MULTI_RANGES)
+            mask = torch.zeros_like(mx, dtype=torch.bool, device=dev)
+            inten = torch.zeros_like(mx, dtype=torch.float32, device=dev)
+            for lo, hi, a, b in ranges:
+                rng = _in_hue_range(h, lo, hi) & (s >= sat_min) & (v >= val_min)
+                mask = mask | rng
+                width = (hi - lo) if hi >= lo else (1.0 - lo + hi)
+                width = width + 1e-6
+                if hi >= lo:
+                    pos = (h - lo) / width
+                else:
+                    pos = torch.where(h >= lo, (h - lo) / width, (h + 1.0 - lo) / width)
+                inten = torch.where(rng, a + pos * (b - a), inten)
+        else:
+            hue_lo = float(hsvp.hue_lo)
+            hue_hi = float(hsvp.hue_hi)
+            mask = (h >= hue_lo) & (h <= hue_hi) & (s >= sat_min) & (v >= val_min)
+            inten = torch.clamp((h - hue_lo) / max(1e-6, (hue_hi - hue_lo)), 0.0, 1.0).to(dtype=torch.float32)
+            inten = torch.where(mask, inten, torch.zeros_like(inten))
+
+    inten = inten.float()
+    mask = mask.to(dtype=torch.bool)
+
     if left_mask_px > 0:
-        mask[:, :left_mask_px] = False; inten[:, :left_mask_px] = 0.0
-    mask = _morph_open_close_torch(mask.astype(np.float32), k=3, device="cpu")
+        mask[:, :left_mask_px] = False
+        inten[:, :left_mask_px] = 0.0
+
+    mask = _morph_open_close_torch(mask.float(), k=3, device=str(dev))
     area_k = 5
-    m = torch.from_numpy(mask.astype(np.float32))[None,None,:,:]
-    s = F.conv2d(m, torch.ones((1,1,area_k,area_k)), padding=area_k//2)
-    mask = (s.squeeze().numpy() >= 3)
-    return mask.astype(bool), inten.astype(np.float32)
+    m = mask.float().unsqueeze(0).unsqueeze(0)
+    kernel = torch.ones((1, 1, area_k, area_k), device=m.device)
+    s_area = F.conv2d(m, kernel, padding=area_k // 2)
+    mask = (s_area.squeeze(0).squeeze(0) >= 3.0)
+    inten = torch.where(mask, inten, torch.zeros_like(inten))
+
+    mask_np = mask.detach().to("cpu").numpy().astype(bool)
+    inten_np = inten.detach().to("cpu").numpy().astype(np.float32)
+    return mask_np, inten_np
 
 def _weak_cache_exists_only(path: str, hsvp: HSVParams, left_mask_px: int) -> bool:
     base = _weak_cache_key_base(path, hsvp, left_mask_px)
@@ -466,7 +521,7 @@ def _weak_cache_exists_only(path: str, hsvp: HSVParams, left_mask_px: int) -> bo
         return len(_weak_fuzzy_candidates(path)) > 0
     return False
 
-def get_weak_label_cached(path: str, hsvp: HSVParams, left_mask_px: int = LEFT_MASK_PX):
+def get_weak_label_cached(path: str, hsvp: HSVParams, left_mask_px: int = LEFT_MASK_PX, device: Optional[str] = None):
     base = _weak_cache_key_base(path, hsvp, left_mask_px)
     w_npz, m_npy, i_npy = _weak_paths(base)
 
@@ -508,7 +563,10 @@ def get_weak_label_cached(path: str, hsvp: HSVParams, left_mask_px: int = LEFT_M
 
     # Recompute (allowed only when strict off)
     img = imread_rgb(path)
-    m, inten = _weak_label_core(img, hsvp, left_mask_px)
+    device_str = device if device is not None else WEAK_LABEL_DEVICE
+    if device_str != "cpu" and not torch.cuda.is_available():
+        device_str = "cpu"
+    m, inten = _weak_label_core(img, hsvp, left_mask_px, device=device_str)
     if WEAK_CACHE_COMPRESS:
         try: _save_weak_npz(w_npz, m, inten)
         except Exception: pass
@@ -661,12 +719,15 @@ class DataConfig:
     pos_crop_thr: float = POS_CROP_THR
     pos_crop_tries: int = POS_CROP_TRIES
     fuse_mode: str = "max"
+    weak_label_device: str = "cpu"
 
 class TwoRadarFusionDataset(Dataset):
     def __init__(self, sources: List[SourceData], split: str = "train", val_split: float = VAL_SPLIT, dcfg: Optional[DataConfig] = None):
         assert len(sources) == 2, "Provide exactly two radar sources."
         self.A, self.B = sources
         self.dcfg = dcfg or DataConfig()
+        if self.dcfg.weak_label_device != "cpu" and not torch.cuda.is_available():
+            self.dcfg.weak_label_device = "cpu"
         ts_all = sorted(set([it["ts"] for it in self.A.items] + [it["ts"] for it in self.B.items]))
         n = len(ts_all); n_val = max(1, int(n * val_split))
         self.ts_list = ts_all[:n - n_val] if split == "train" else ts_all[n - n_val:]
@@ -754,7 +815,12 @@ class TwoRadarFusionDataset(Dataset):
                     pairs.append(None); present_flags.append(0.0)
                 else:
                     path = S.ts_to_path[t]
-                    m, inten = get_weak_label_cached(path, self.dcfg.hsv, self.dcfg.left_mask_px)
+                    m, inten = get_weak_label_cached(
+                        path,
+                        self.dcfg.hsv,
+                        self.dcfg.left_mask_px,
+                        device=self.dcfg.weak_label_device,
+                    )
                     pairs.append((m, inten)); present_flags.append(1.0)
 
         crop_sz = max(1, int(self.dcfg.crop))
@@ -1045,7 +1111,10 @@ def build_sources(rank=0):
     return sources
 
 def make_loaders(sources, device, rank, world_size, num_workers, prefetch_factor):
-    dcfg = DataConfig()
+    weak_dev = WEAK_LABEL_DEVICE
+    if weak_dev != "cpu" and not torch.cuda.is_available():
+        weak_dev = "cpu"
+    dcfg = DataConfig(weak_label_device=weak_dev)
     train_ds = TwoRadarFusionDataset(sources, split="train", val_split=VAL_SPLIT, dcfg=dcfg)
     val_ds   = TwoRadarFusionDataset(sources, split="val",   val_split=VAL_SPLIT, dcfg=dcfg)
 
@@ -1371,7 +1440,7 @@ def _init_worker(omp_threads: int = 1):
     except Exception:
         pass
 
-def _prep_single(path: str, left_mask_px: int, hsvp: HSVParams, do_rgb: bool):
+def _prep_single(path: str, left_mask_px: int, hsvp: HSVParams, do_rgb: bool, device: str):
     # Compute & write weak-label cache; optionally write RGB cache
     # NOTE: STRICT_CACHE_ONLY is ignored in cpu-prep; we always compute here.
     base = _weak_cache_key_base(path, hsvp, left_mask_px)
@@ -1379,7 +1448,7 @@ def _prep_single(path: str, left_mask_px: int, hsvp: HSVParams, do_rgb: bool):
     # Only recompute if truly missing
     if not (os.path.isfile(w_npz) or (os.path.isfile(m_npy) and os.path.isfile(i_npy))):
         img = imread_rgb(path)
-        m, inten = _weak_label_core(img, hsvp, left_mask_px)
+        m, inten = _weak_label_core(img, hsvp, left_mask_px, device=device)
         if WEAK_CACHE_COMPRESS:
             _save_weak_npz(w_npz, m, inten)
         else:
@@ -1476,7 +1545,7 @@ def stage_cpu_prep(args):
             todo_paths = [p for p in todo_paths if not _weak_cache_exists_only(p, hsvp, LEFT_MASK_PX)]
 
         random.shuffle(todo_paths)
-        work = [(p, LEFT_MASK_PX, hsvp, args.do_rgb_cache) for p in todo_paths]
+        work = [(p, LEFT_MASK_PX, hsvp, args.do_rgb_cache, WEAK_LABEL_DEVICE) for p in todo_paths]
 
         max_workers = args.prep_workers or max(1, (os.cpu_count() or 2) - 1)
         omp_per_worker = max(1, args.omp_per_worker)
@@ -1582,6 +1651,7 @@ def parse_args():
     p.add_argument("--prep-workers", type=int, default=None, help="CPU-prep parallel workers (default: cpu_count-1)")
     p.add_argument("--omp-per-worker", type=int, default=1, help="OpenMP/MKL threads per worker")
     p.add_argument("--fast-io", action="store_true", help="Use faster, larger caches (RGB npy, no weak compress/bitpack)")
+    p.add_argument("--prep-on-gpu", action="store_true", help="Run weak-label prep on GPU when available")
     # Shared paths
     p.add_argument("--radar-dirs", type=str, default=None, help="Comma-separated radar folders, e.g. /data/njk,/data/nkm")
     p.add_argument("--work-dir", type=str, default=os.environ.get("WORK_DIR", WORK_DIR), help="Where to save checkpoints/logs")
@@ -1609,6 +1679,14 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    requested_device = "cuda" if getattr(args, "prep_on_gpu", False) else "cpu"
+    if requested_device != "cpu" and not torch.cuda.is_available():
+        print("⚠️  --prep-on-gpu requested but CUDA is unavailable; falling back to CPU.", flush=True)
+        requested_device = "cpu"
+    WEAK_LABEL_DEVICE = requested_device
+    if WEAK_LABEL_DEVICE != "cpu":
+        print(f"🖥️  Weak-label preprocessing device: {WEAK_LABEL_DEVICE}", flush=True)
+
     if args.radar_dirs:
         RADAR_DIRS[:] = [p.strip() for p in args.radar_dirs.split(",") if p.strip()]
     WORK_DIR = args.work_dir
