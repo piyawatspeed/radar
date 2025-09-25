@@ -19,7 +19,7 @@
 #   train (strict):  python ddp.py --stage gpu-train --strict-cache-only --strict-atlas-only --radar-dirs /path/njk,/path/nkm --cache-root /big/cache
 
 from __future__ import annotations
-import os, re, glob, math, time, random, json, gc, contextlib, hashlib, bisect, argparse
+import os, re, glob, math, time, random, gc, contextlib, bisect, argparse
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timedelta
@@ -222,34 +222,34 @@ def add_minutes(ts: int, minutes: int) -> int: return dt_to_ts(ts_to_dt(ts) + ti
 
 def ensure_dir(d: str):
     if d: os.makedirs(d, exist_ok=True)
-def _stable_file_id(path: str) -> str:
-    """Machine-agnostic fingerprint for a file: size + first/last 256KB."""
-    try:
-        st = os.stat(path)
-        size = int(st.st_size)
-        h = hashlib.md5()
-        with open(path, "rb") as f:
-            chunk = f.read(256 * 1024)
-            h.update(chunk)
-            if size > 256 * 1024:
-                f.seek(max(0, size - 256 * 1024))
-                h.update(f.read(256 * 1024))
-        h.update(str(size).encode())
-        return h.hexdigest()[:10]
-    except Exception:
-        try:
-            size = os.path.getsize(path)
-        except Exception:
-            size = 0
-        return hashlib.md5((os.path.basename(path) + str(size)).encode()).hexdigest()[:10]
 
+
+def _image_timestamp_token(path: str) -> str:
+    """Derive a stable token from the filename timestamp (fallback to basename)."""
+    ts = parse_timestamp(path)
+    if ts is not None:
+        return str(ts)
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _tokenize_value(value) -> str:
+    if isinstance(value, float):
+        token = format(value, ".6g")
+        if token.endswith(".0"):
+            token = token[:-2]
+    else:
+        token = str(value)
+    token = token.replace(".", "p").replace("-", "m")
+    token = re.sub(r"[^A-Za-z0-9]+", "-", token).strip("-")
+    return token or "0"
 
 
 def _rgb_cache_path(path: str) -> str:
     base = os.path.splitext(os.path.basename(path))[0]
-    h = _stable_file_id(path)
+    token = _image_timestamp_token(path)
+    stem = base if token in base else f"{base}.{token}"
     ext = ".npy" if RGB_CACHE_MODE == "npy" else ".npz"
-    return os.path.join(RGB_CACHE_DIR, f"{base}.{h}{ext}")
+    return os.path.join(RGB_CACHE_DIR, f"{stem}{ext}")
 
 def _atomic_write(target_path: str, writer_fn):
     tmp_dir = os.path.dirname(target_path) or "."
@@ -295,16 +295,18 @@ def imread_rgb(path: str) -> np.ndarray:
 
 # --------- Weak-label compressed cache (.npz with bit-packed mask + float16 inten) ----------
 def _weak_cache_key_base(path: str, hsvp, left_mask_px: int) -> str:
-    fid = _stable_file_id(path)
-    sig = {
-        "fid": fid,
-        "mode": WEAK_LABEL_MODE,
-        "hsvp": dict(h_lo=hsvp.hue_lo, h_hi=hsvp.hue_hi, s=HSV_S_MIN, v=HSV_V_MIN),
-        "left": left_mask_px,
-    }
-    h = hashlib.md5(json.dumps(sig, sort_keys=True).encode()).hexdigest()
     base = os.path.splitext(os.path.basename(path))[0]
-    return os.path.join(CACHE_DIR, f"{base}.{h}.weak")
+    token = _image_timestamp_token(path)
+    stem = base if token in base else f"{base}.{token}"
+    params = [
+        f"mode-{_tokenize_value(WEAK_LABEL_MODE)}",
+        f"h-{_tokenize_value(hsvp.hue_lo)}-{_tokenize_value(hsvp.hue_hi)}",
+        f"s-{_tokenize_value(hsvp.sat_min)}",
+        f"v-{_tokenize_value(hsvp.val_min)}",
+        f"left-{_tokenize_value(left_mask_px)}",
+    ]
+    param_str = ".".join(params)
+    return os.path.join(CACHE_DIR, f"{stem}.{param_str}.weak")
 
 
 def _weak_paths(base: str):
@@ -428,11 +430,13 @@ def _morph_open_close_torch(mask_np: np.ndarray, k: int = 3, device: str = "cpu"
 def _weak_label_core(img_rgb: np.ndarray, hsvp: HSVParams, left_mask_px: int):
     Hh, S, V = rgb_to_hsv_np(img_rgb).transpose(2,0,1)
     H, W = Hh.shape
+    sat_min = hsvp.sat_min
+    val_min = hsvp.val_min
     if WEAK_LABEL_MODE == "hsv_multi":
         ranges = _union_hue_ranges(Hh, HSV_MULTI_RANGES)
         mask = np.zeros((H, W), dtype=bool); inten = np.zeros((H, W), dtype=np.float32)
         for lo, hi, a, b in ranges:
-            rng = _in_hue_range(Hh, lo, hi) & (S >= HSV_S_MIN) & (V >= HSV_V_MIN)
+            rng = _in_hue_range(Hh, lo, hi) & (S >= sat_min) & (V >= val_min)
             mask |= rng
             width = (hi - lo) if hi >= lo else (1.0 - lo + hi)
             pos = np.where(hi >= lo, (Hh - lo) / (width + 1e-6),
@@ -440,7 +444,7 @@ def _weak_label_core(img_rgb: np.ndarray, hsvp: HSVParams, left_mask_px: int):
             inten[rng] = (a + pos[rng] * (b - a)).astype(np.float32)
     else:
         hue_lo = hsvp.hue_lo; hue_hi = hsvp.hue_hi
-        mask = (Hh >= hue_lo) & (Hh <= hue_hi) & (S >= HSV_S_MIN) & (V >= HSV_V_MIN)
+        mask = (Hh >= hue_lo) & (Hh <= hue_hi) & (S >= sat_min) & (V >= val_min)
         inten = np.clip((Hh - hue_lo) / max(1e-6, (hue_hi - hue_lo)), 0.0, 1.0).astype(np.float32)
         inten[~mask] = 0.0
     if left_mask_px > 0:
