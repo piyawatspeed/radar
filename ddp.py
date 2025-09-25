@@ -1548,6 +1548,12 @@ def stage_cpu_prep(args):
         work = [(p, LEFT_MASK_PX, hsvp, args.do_rgb_cache, WEAK_LABEL_DEVICE) for p in todo_paths]
 
         max_workers = args.prep_workers or max(1, (os.cpu_count() or 2) - 1)
+        if WEAK_LABEL_DEVICE != "cpu" and max_workers != 1:
+            print(
+                "⚠️  Forcing --prep-workers=1 because weak labels are running on the GPU",
+                flush=True,
+            )
+            max_workers = 1
         omp_per_worker = max(1, args.omp_per_worker)
         print(f"🧵 Spawning {max_workers} workers (OMP threads/worker={omp_per_worker}) on {len(work)} files", flush=True)
 
