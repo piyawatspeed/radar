@@ -63,12 +63,20 @@ for _d in [WORK_DIR, CACHE_DIR, RGB_CACHE_DIR]:
     os.makedirs(_d, exist_ok=True)
 
 # Weak-cache sharding / shared store configuration
+def _env_flag(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 WEAK_CACHE_BACKEND = os.environ.get("WEAK_CACHE_BACKEND", "").strip().lower() or None
 WEAK_CACHE_SHARD_BY = os.environ.get("WEAK_CACHE_SHARD_BY", "day").strip().lower()
 try:
     WEAK_CACHE_LMDB_MAP_SIZE = int(os.environ.get("WEAK_CACHE_LMDB_MAP_SIZE", str(1 << 34)))
 except ValueError:
     WEAK_CACHE_LMDB_MAP_SIZE = 1 << 34
+WEAK_CACHE_WRITE_FILES = _env_flag("WEAK_CACHE_WRITE_FILES", True)
 
 # RGB caching: "off" | "npy" | "npz"
 RGB_CACHE_MODE = "off"   # will be set to "npy" during cpu-prep when --fast-io/--do-rgb-cache
@@ -862,9 +870,15 @@ def get_weak_label_cached(path: str, hsvp: HSVParams, left_mask_px: int = LEFT_M
         try:
             m = np.load(m_npy, mmap_mode="r").astype(bool)
             inten = np.load(i_npy, mmap_mode="r").astype(np.float32)
-            if WEAK_CACHE_COMPRESS:
+            if WEAK_CACHE_COMPRESS and WEAK_CACHE_WRITE_FILES:
                 try:
                     _save_weak_npz(w_npz, m, inten)
+                except Exception:
+                    pass
+            elif WEAK_CACHE_WRITE_FILES and not WEAK_CACHE_COMPRESS:
+                try:
+                    np.save(m_npy, m.astype(np.uint8))
+                    np.save(i_npy, inten.astype(np.float32))
                 except Exception:
                     pass
             if store:
@@ -903,9 +917,15 @@ def get_weak_label_cached(path: str, hsvp: HSVParams, left_mask_px: int = LEFT_M
     if store:
         try: store.set(key, m, inten)
         except Exception: pass
-    if WEAK_CACHE_COMPRESS:
+    if WEAK_CACHE_COMPRESS and WEAK_CACHE_WRITE_FILES:
         try: _save_weak_npz(w_npz, m, inten)
         except Exception: pass
+    elif WEAK_CACHE_WRITE_FILES and not WEAK_CACHE_COMPRESS:
+        try:
+            np.save(m_npy, m.astype(np.uint8))
+            np.save(i_npy, inten.astype(np.float32))
+        except Exception:
+            pass
     return m, inten
 
 # ===========================
@@ -1782,20 +1802,27 @@ def _prep_single(path: str, left_mask_px: int, hsvp: HSVParams, do_rgb: bool, de
     key = _weak_cache_key_base(path, hsvp, left_mask_px)
     store = get_weak_cache_store()
     w_npz, m_npy, i_npy = _weak_paths(key)
-    # Only recompute if truly missing
     have_disk = os.path.isfile(w_npz) or (os.path.isfile(m_npy) and os.path.isfile(i_npy))
-    if not have_disk:
+    have_store = False
+    if store:
+        try:
+            have_store = store.exists(key)
+        except Exception:
+            have_store = False
+    # Only recompute if truly missing
+    if not (have_store or have_disk):
         img = imread_rgb(path)
         m, inten = _weak_label_core(img, hsvp, left_mask_px, device=device)
         if store:
             try: store.set(key, m, inten)
             except Exception: pass
-        if WEAK_CACHE_COMPRESS:
-            _save_weak_npz(w_npz, m, inten)
-        else:
-            np.save(m_npy, m.astype(np.uint8))
-            np.save(i_npy, inten.astype(np.float32))
-    elif store and not store.exists(key):
+        if WEAK_CACHE_WRITE_FILES:
+            if WEAK_CACHE_COMPRESS:
+                _save_weak_npz(w_npz, m, inten)
+            else:
+                np.save(m_npy, m.astype(np.uint8))
+                np.save(i_npy, inten.astype(np.float32))
+    elif store and have_disk and not have_store:
         try:
             if os.path.isfile(w_npz):
                 m, inten = _load_weak_npz(w_npz)
@@ -1852,7 +1879,8 @@ def stage_cpu_prep(args):
 
     print(
         f"RGB_CACHE_MODE={RGB_CACHE_MODE} | weak: compress={WEAK_CACHE_COMPRESS} "
-        f"packbits={WEAK_PACK_MASK_BITS} inten_dtype={'u8' if WEAK_INTEN_DTYPE is np.uint8 else 'f16'}",
+        f"packbits={WEAK_PACK_MASK_BITS} inten_dtype={'u8' if WEAK_INTEN_DTYPE is np.uint8 else 'f16'} "
+        f"files={'on' if WEAK_CACHE_WRITE_FILES else 'off'}",
         flush=True
     )
 
