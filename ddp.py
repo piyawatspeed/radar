@@ -1155,30 +1155,63 @@ class TwoRadarFusionDataset(Dataset):
         return self._nearest_within(s, targ, tol)
 
     def _rand_view(self):
-        return (random.random() < 0.5, random.random() < 0.5, random.randint(0,3))
+        flip_h = bool(torch.randint(0, 2, (1,)).item())
+        flip_v = bool(torch.randint(0, 2, (1,)).item())
+        k = int(torch.randint(0, 4, (1,)).item())
+        return flip_h, flip_v, k
 
-    def _apply_view(self, arr, view):
+    def _apply_view(self, tensor: torch.Tensor, view):
         flip_h, flip_v, k = view
-        if flip_h: arr = arr[:, ::-1]
-        if flip_v: arr = arr[::-1, :]
-        if k: arr = np.rot90(arr, k)
-        return arr
+        if flip_h:
+            tensor = torch.flip(tensor, dims=(-1,))
+        if flip_v:
+            tensor = torch.flip(tensor, dims=(-2,))
+        if k:
+            tensor = torch.rot90(tensor, k, dims=(-2, -1))
+        return tensor
 
-    def _pad_to(self, a: np.ndarray, th: int, tw: int):
-        ph = max(0, th - a.shape[0]); pw = max(0, tw - a.shape[1])
-        if ph or pw: a = np.pad(a, ((0,ph),(0,pw)), mode="reflect")
-        return a
+    def _pad_to(self, tensor: torch.Tensor, th: int, tw: int, mode: str = "reflect", value: float = 0.0):
+        ph = max(0, th - tensor.shape[-2])
+        pw = max(0, tw - tensor.shape[-1])
+        if not (ph or pw):
+            return tensor
 
-    def _choose_crop(self, chs: List[np.ndarray], y_mask: np.ndarray, crop: int):
-        H, W = chs[0].shape
-        if random.random() < self.dcfg.pos_crop_prob:
+        pad_mode = mode
+        if pad_mode == "reflect" and (tensor.shape[-2] <= 1 or tensor.shape[-1] <= 1):
+            pad_mode = "replicate"
+
+        pad = (0, pw, 0, ph)
+        work = tensor
+        needs_threshold = False
+        if tensor.dtype == torch.bool and pad_mode != "constant":
+            work = tensor.float()
+            needs_threshold = True
+        work = work.unsqueeze(0).unsqueeze(0)
+        if pad_mode == "constant":
+            work = F.pad(work, pad, mode="constant", value=value)
+        else:
+            work = F.pad(work, pad, mode=pad_mode)
+        work = work.squeeze(0).squeeze(0)
+        if needs_threshold:
+            work = work > 0.5
+        return work
+
+    def _choose_crop(self, chs: List[torch.Tensor], y_mask: torch.Tensor, crop: int):
+        H, W = chs[0].shape[-2], chs[0].shape[-1]
+
+        def _rand_coord(limit: int):
+            if limit <= 0:
+                return 0
+            return int(torch.randint(0, limit + 1, (1,)).item())
+
+        if torch.rand(()).item() < self.dcfg.pos_crop_prob:
             for _ in range(self.dcfg.pos_crop_tries):
-                y0 = 0 if H <= crop else random.randint(0, H - crop)
-                x0 = 0 if W <= crop else random.randint(0, W - crop)
-                if y_mask[y0:y0+crop, x0:x0+crop].mean() > self.dcfg.pos_crop_thr:
+                y0 = 0 if H <= crop else _rand_coord(H - crop)
+                x0 = 0 if W <= crop else _rand_coord(W - crop)
+                if y_mask[..., y0:y0+crop, x0:x0+crop].float().mean().item() > self.dcfg.pos_crop_thr:
                     return y0, x0
-        y0 = 0 if H <= crop else random.randint(0, H - crop)
-        x0 = 0 if W <= crop else random.randint(0, W - crop)
+        y0 = 0 if H <= crop else _rand_coord(H - crop)
+        x0 = 0 if W <= crop else _rand_coord(W - crop)
         return y0, x0
 
     def __getitem__(self, idx: int):
@@ -1198,91 +1231,126 @@ class TwoRadarFusionDataset(Dataset):
                         found = True; break
                 if found: break
 
-        pairs = []; present_flags = []
+        pairs: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
+        present_flags: List[float] = []
         for tlist, S in [(a_ts, self.A), (b_ts, self.B)]:
             for t in tlist:
                 if t is None:
-                    pairs.append(None); present_flags.append(0.0)
+                    pairs.append(None)
+                    present_flags.append(0.0)
                 else:
                     path = S.ts_to_path[t]
-                    m, inten = get_weak_label_cached(
+                    m_np, inten_np = get_weak_label_cached(
                         path,
                         self.dcfg.hsv,
                         self.dcfg.left_mask_px,
                         device=self.dcfg.weak_label_device,
                     )
-                    pairs.append((m, inten)); present_flags.append(1.0)
+                    m_t = torch.from_numpy(m_np).to(torch.bool)
+                    inten_t = torch.from_numpy(inten_np).to(torch.float32)
+                    pairs.append((m_t, inten_t))
+                    present_flags.append(1.0)
 
         crop_sz = max(1, int(self.dcfg.crop))
         shapes = [p[0].shape for p in pairs if p is not None]
-        H, W = (crop_sz, crop_sz) if len(shapes) == 0 else (max(s[0] for s in shapes), max(s[1] for s in shapes))
+        if len(shapes) == 0:
+            H = W = crop_sz
+        else:
+            H = max(int(s[0]) for s in shapes)
+            W = max(int(s[1]) for s in shapes)
 
-        def to_hw(pair):
+        def resize_to_hw(pair):
             if pair is None:
-                return (np.zeros((H,W), bool), np.zeros((H,W), np.float32))
-            m, inten = pair
-            if m.shape == (H,W):
-                return (m, inten)
-            ph = max(0, H - m.shape[0]); pw = max(0, W - m.shape[1])
-            if ph or pw:
-                m = np.pad(m, ((0,ph),(0,pw)), mode="edge")
-                inten = np.pad(inten, ((0,ph),(0,pw)), mode="edge")
-            return (m[:H,:W], inten[:H,:W])
+                return (
+                    torch.zeros((H, W), dtype=torch.bool),
+                    torch.zeros((H, W), dtype=torch.float32),
+                )
+            mask, inten = pair
+            if mask.shape != (H, W):
+                mask = self._pad_to(mask, H, W, mode="replicate")
+                mask = mask[:H, :W]
+            if inten.shape != (H, W):
+                inten = self._pad_to(inten, H, W, mode="replicate")
+                inten = inten[:H, :W]
+            return mask, inten
 
-        frames_hw = []; avs_hw = []
+        frames_hw: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        avs_hw: List[torch.Tensor] = []
         for pair, pflag in zip(pairs, present_flags):
-            m, inten = to_hw(pair)
-            frames_hw.append((m, inten))
-            avs_hw.append(np.full((H, W), float(pflag), dtype=np.float32))
+            mask_t, inten_t = resize_to_hw(pair)
+            frames_hw.append((mask_t, inten_t))
+            avs_hw.append(torch.full((H, W), float(pflag), dtype=torch.float32))
 
-        atlas_A = _fit_mask_to(H, W, self.A.atlas); atlas_B = _fit_mask_to(H, W, self.B.atlas)
+        atlas_A = torch.from_numpy(_fit_mask_to(H, W, self.A.atlas)).to(torch.bool)
+        atlas_B = torch.from_numpy(_fit_mask_to(H, W, self.B.atlas)).to(torch.bool)
 
         def proc_triplet(triplet, av_triplet, atlas):
-            out_inten = []; out_av = []; mask_t = None; inten_t = None
-            for i, ((m, inten), av) in enumerate(zip(triplet, av_triplet)):
-                inten = np.where(atlas, 0.0, inten).astype(np.float32)
-                m = np.where(atlas, 0, m).astype(bool)
+            out_inten = []
+            out_av = []
+            mask_t = None
+            inten_t = None
+            for i, ((mask, inten), av) in enumerate(zip(triplet, av_triplet)):
+                inten = inten.masked_fill(atlas, 0.0)
+                mask = mask.logical_and(~atlas)
                 out_inten.append(inten)
-                out_av.append(av.astype(np.float32))
+                out_av.append(av.to(torch.float32))
                 if i == 1:
-                    mask_t, inten_t = m, inten
+                    mask_t, inten_t = mask, inten
             return out_inten, out_av, mask_t, inten_t
 
-        A_prev, A_t, A_next = frames_hw[0:3]; B_prev, B_t, B_next = frames_hw[3:6]
-        A_prev_av, A_t_av, A_next_av = avs_hw[0:3]; B_prev_av, B_t_av, B_next_av = avs_hw[3:6]
+        A_prev, A_t, A_next = frames_hw[0:3]
+        B_prev, B_t, B_next = frames_hw[3:6]
+        A_prev_av, A_t_av, A_next_av = avs_hw[0:3]
+        B_prev_av, B_t_av, B_next_av = avs_hw[3:6]
 
         intenA, avA, maskA_t, intenA_t = proc_triplet([A_prev, A_t, A_next], [A_prev_av, A_t_av, A_next_av], atlas_A)
         intenB, avB, maskB_t, intenB_t = proc_triplet([B_prev, B_t, B_next], [B_prev_av, B_t_av, B_next_av], atlas_B)
-        y_dbz = (intenA_t + intenB_t)/2.0 if self.dcfg.fuse_mode == "mean" else np.maximum(intenA_t, intenB_t)
-        y_mask = (maskA_t | maskB_t)
+        if self.dcfg.fuse_mode == "mean":
+            y_dbz = (intenA_t + intenB_t) * 0.5
+        else:
+            y_dbz = torch.maximum(intenA_t, intenB_t)
+        y_mask = maskA_t.logical_or(maskB_t)
 
-        key = (H,W)
-        if key not in self._hc_cache: self._hc_cache[key] = helper_channels(H, W, center=None)
-        r_norm, cos_t, sin_t = self._hc_cache[key]
+        key = (H, W)
+        if key not in self._hc_cache:
+            self._hc_cache[key] = tuple(torch.from_numpy(arr).to(torch.float32) for arr in helper_channels(H, W, center=None))
+        r_norm, cos_t, sin_t = (t.clone() for t in self._hc_cache[key])
 
-        chs = [intenA[0], intenA[1], intenA[2], intenB[0], intenB[1], intenB[2],
-               avA[0],    avA[1],    avA[2],    avB[0],    avB[1],    avB[2],    r_norm, cos_t, sin_t]
+        chs = [
+            intenA[0], intenA[1], intenA[2],
+            intenB[0], intenB[1], intenB[2],
+            avA[0],    avA[1],    avA[2],
+            avB[0],    avB[1],    avB[2],
+            r_norm, cos_t, sin_t,
+        ]
 
         view = self._rand_view()
-        chs = [self._apply_view(a, view) for a in chs]
-        y_mask = self._apply_view(y_mask.astype(np.float32), view) > 0.5
-        y_dbz  = self._apply_view(y_dbz, view)
+        chs = [self._apply_view(ch, view) for ch in chs]
+        y_mask = self._apply_view(y_mask, view)
+        y_dbz = self._apply_view(y_dbz, view)
 
-        def pad_min(a): return self._pad_to(a, max(crop_sz, a.shape[0]), max(crop_sz, a.shape[1]))
-        chs = [pad_min(a) for a in chs]
-        y_mask = pad_min(y_mask.astype(np.float32)) > 0.5
-        y_dbz  = pad_min(y_dbz)
+        target_h = max(crop_sz, max(int(ch.shape[0]) for ch in chs))
+        target_w = max(crop_sz, max(int(ch.shape[1]) for ch in chs))
+        chs = [self._pad_to(ch, target_h, target_w, mode="reflect") for ch in chs]
+        y_mask = self._pad_to(y_mask, target_h, target_w, mode="reflect")
+        y_dbz = self._pad_to(y_dbz, target_h, target_w, mode="reflect")
 
         crop = crop_sz
-        y0, x0 = self._choose_crop(chs, y_mask.astype(np.float32), crop)
-        chs = [a[y0:y0+crop, x0:x0+crop] for a in chs]
+        y0, x0 = self._choose_crop(chs, y_mask, crop)
+        chs = [ch[y0:y0+crop, x0:x0+crop] for ch in chs]
         y_mask = y_mask[y0:y0+crop, x0:x0+crop]
-        y_dbz  = y_dbz[y0:y0+crop, x0:x0+crop]
+        y_dbz = y_dbz[y0:y0+crop, x0:x0+crop]
 
-        x = np.stack(chs, axis=0).astype(np.float32)
-        y_mask = y_mask.astype(np.float32)[None, ...]
-        y_dbz  = y_dbz.astype(np.float32)[None, ...]
-        return {"x": torch.from_numpy(x), "y_mask": torch.from_numpy(y_mask), "y_dbz": torch.from_numpy(y_dbz)}
+        x = torch.stack(chs, dim=0).to(torch.float32)
+        y_mask = y_mask.to(torch.float32).unsqueeze(0)
+        y_dbz = y_dbz.to(torch.float32).unsqueeze(0)
+
+        if torch.cuda.is_available():
+            x = x.pin_memory()
+            y_mask = y_mask.pin_memory()
+            y_dbz = y_dbz.pin_memory()
+
+        return {"x": x.contiguous(), "y_mask": y_mask.contiguous(), "y_dbz": y_dbz.contiguous()}
 
 # ===========================
 # Model: Tiny U-Net with GroupNorm
@@ -1512,8 +1580,10 @@ def make_loaders(sources, device, rank, world_size, num_workers, prefetch_factor
     val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=rank, shuffle=False, drop_last=False) if ddp_is_dist() else None
 
     def _wif(worker_id):
-        np.random.seed(SEED + worker_id + rank*1000)
-        random.seed(SEED + worker_id + rank*1000)
+        seed = SEED + worker_id + rank*1000
+        np.random.seed(seed)
+        random.seed(seed)
+        torch.manual_seed(seed)
 
     g = torch.Generator(); g.manual_seed(SEED + rank)
     pin = (device.type == "cuda")
