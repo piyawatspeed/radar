@@ -283,6 +283,27 @@ def _atomic_write(target_path: str, writer_fn):
         except Exception: pass
         raise
 
+def _write_rgb_cache(path: str, arr: np.ndarray) -> None:
+    if RGB_CACHE_MODE == "off":
+        return
+    cpath = _rgb_cache_path(path)
+    if os.path.isfile(cpath):
+        return
+
+    arr_to_write = np.ascontiguousarray(arr)
+
+    def _writer_np(p):
+        np.save(p, arr_to_write)
+
+    def _writer_npz(p):
+        np.savez_compressed(p, arr=arr_to_write)
+
+    try:
+        _atomic_write(cpath, _writer_np if RGB_CACHE_MODE == "npy" else _writer_npz)
+    except Exception:
+        pass
+
+
 def imread_rgb(path: str) -> np.ndarray:
     """Fast decoding via Pillow-SIMD; optional compact RGB cache."""
     if RGB_CACHE_MODE != "off":
@@ -299,17 +320,12 @@ def imread_rgb(path: str) -> np.ndarray:
             except Exception:
                 pass
     with Image.open(path) as img:
-        try: img.draft("RGB", img.size)
-        except Exception: pass
-        arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
-    if RGB_CACHE_MODE != "off":
-        def _writer_np(p): np.save(p, arr)
-        def _writer_npz(p): np.savez_compressed(p, arr=arr)
-        cpath = _rgb_cache_path(path)
         try:
-            _atomic_write(cpath, _writer_np if RGB_CACHE_MODE=="npy" else _writer_npz)
+            img.draft("RGB", img.size)
         except Exception:
             pass
+        arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+    _write_rgb_cache(path, arr)
     return arr
 
 # --------- Weak-label compressed cache (.npz with bit-packed mask + float16 inten) ----------
@@ -1833,8 +1849,11 @@ def _prep_single(path: str, left_mask_px: int, hsvp: HSVParams, do_rgb: bool, de
             store.set(key, m, inten)
         except Exception:
             pass
-    if do_rgb and (RGB_CACHE_MODE != "off") and predecoded is None:
-        _ = imread_rgb(path)  # will write if missing
+    if do_rgb and (RGB_CACHE_MODE != "off"):
+        if predecoded is None:
+            _ = imread_rgb(path)  # will write if missing
+        else:
+            _write_rgb_cache(path, predecoded)
     return os.path.basename(path)
 
 def weak_cache_status(sources, hsvp, left_mask_px):
