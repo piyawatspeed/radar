@@ -19,7 +19,7 @@
 #   train (strict):  python ddp.py --stage gpu-train --strict-cache-only --strict-atlas-only --radar-dirs /path/njk,/path/nkm --cache-root /big/cache
 
 from __future__ import annotations
-import os, re, glob, math, time, random, gc, contextlib, bisect, argparse, io, hashlib
+import os, re, glob, math, time, random, gc, contextlib, bisect, argparse, io, hashlib, threading, queue
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Iterable, Any
 from datetime import datetime, timedelta
@@ -1796,7 +1796,8 @@ def _init_worker(omp_threads: int = 1):
     except Exception:
         pass
 
-def _prep_single(path: str, left_mask_px: int, hsvp: HSVParams, do_rgb: bool, device: str):
+def _prep_single(path: str, left_mask_px: int, hsvp: HSVParams, do_rgb: bool, device: str,
+                 predecoded: Optional[np.ndarray] = None):
     # Compute & write weak-label cache; optionally write RGB cache
     # NOTE: STRICT_CACHE_ONLY is ignored in cpu-prep; we always compute here.
     key = _weak_cache_key_base(path, hsvp, left_mask_px)
@@ -1811,7 +1812,7 @@ def _prep_single(path: str, left_mask_px: int, hsvp: HSVParams, do_rgb: bool, de
             have_store = False
     # Only recompute if truly missing
     if not (have_store or have_disk):
-        img = imread_rgb(path)
+        img = predecoded if predecoded is not None else imread_rgb(path)
         m, inten = _weak_label_core(img, hsvp, left_mask_px, device=device)
         if store:
             try: store.set(key, m, inten)
@@ -1832,7 +1833,7 @@ def _prep_single(path: str, left_mask_px: int, hsvp: HSVParams, do_rgb: bool, de
             store.set(key, m, inten)
         except Exception:
             pass
-    if do_rgb and (RGB_CACHE_MODE != "off"):
+    if do_rgb and (RGB_CACHE_MODE != "off") and predecoded is None:
         _ = imread_rgb(path)  # will write if missing
     return os.path.basename(path)
 
@@ -1926,18 +1927,70 @@ def stage_cpu_prep(args):
         random.shuffle(todo_paths)
         work = [(p, LEFT_MASK_PX, hsvp, args.do_rgb_cache, WEAK_LABEL_DEVICE) for p in todo_paths]
 
-        max_workers = args.prep_workers or max(1, (os.cpu_count() or 2) - 1)
-        omp_per_worker = max(1, args.omp_per_worker)
-        print(f"🧵 Spawning {max_workers} workers (OMP threads/worker={omp_per_worker}) on {len(work)} files", flush=True)
-
         errors = []
-        with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(omp_per_worker,)) as ex:
-            fut_map = {ex.submit(_prep_single, *task): task[0] for task in work}
-            for fut in tqdm(as_completed(fut_map), total=len(fut_map), dynamic_ncols=True, mininterval=0.1, miniters=1):
-                try:
-                    fut.result()  # <- surface exceptions!
-                except Exception as e:
-                    errors.append((fut_map[fut], repr(e)))
+        use_cuda_prep = (
+            WEAK_LABEL_DEVICE is not None
+            and str(WEAK_LABEL_DEVICE).startswith("cuda")
+            and torch.cuda.is_available()
+        )
+
+        if use_cuda_prep:
+            total_files = len(work)
+            print(
+                f"🚀 GPU weak-label pipeline on {WEAK_LABEL_DEVICE} (decode thread + GPU worker) for {total_files} files",
+                flush=True,
+            )
+            if total_files > 0:
+                decode_queue = queue.Queue(maxsize=2)
+                sentinel = object()
+
+                def _decode_worker():
+                    for task in work:
+                        path = task[0]
+                        try:
+                            img = imread_rgb(path)
+                        except Exception as e:
+                            decode_queue.put(("error", path, repr(e)))
+                            continue
+                        decode_queue.put(("data", task, img))
+                    decode_queue.put((sentinel, None, None))
+
+                decoder = threading.Thread(target=_decode_worker, name="weak-prep-decode", daemon=True)
+                decoder.start()
+
+                pbar = tqdm(total=total_files, dynamic_ncols=True, mininterval=0.1, miniters=1)
+                while True:
+                    item = decode_queue.get()
+                    tag = item[0]
+                    if tag is sentinel:
+                        break
+                    if tag == "error":
+                        _, path, msg = item
+                        errors.append((path, msg))
+                        pbar.update(1)
+                        continue
+                    _, task, img = item
+                    path, left_mask_px, task_hsvp, do_rgb, device = task
+                    try:
+                        _prep_single(path, left_mask_px, task_hsvp, do_rgb, device, predecoded=img)
+                    except Exception as e:
+                        errors.append((path, repr(e)))
+                    finally:
+                        pbar.update(1)
+                decoder.join()
+                pbar.close()
+        else:
+            max_workers = args.prep_workers or max(1, (os.cpu_count() or 2) - 1)
+            omp_per_worker = max(1, args.omp_per_worker)
+            print(f"🧵 Spawning {max_workers} workers (OMP threads/worker={omp_per_worker}) on {len(work)} files", flush=True)
+
+            with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(omp_per_worker,)) as ex:
+                fut_map = {ex.submit(_prep_single, *task): task[0] for task in work}
+                for fut in tqdm(as_completed(fut_map), total=len(fut_map), dynamic_ncols=True, mininterval=0.1, miniters=1):
+                    try:
+                        fut.result()  # <- surface exceptions!
+                    except Exception as e:
+                        errors.append((fut_map[fut], repr(e)))
 
         if errors:
             print(f"⚠️  {len(errors)} files failed during precompute. Showing up to 10:", flush=True)
