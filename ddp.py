@@ -274,15 +274,30 @@ def _rgb_cache_path(path: str) -> str:
 
 def _atomic_write(target_path: str, writer_fn):
     tmp_dir = os.path.dirname(target_path) or "."
+    target_ext = os.path.splitext(target_path)[1]
+    tmp_suffix = target_ext if target_ext else ".tmp"
     import tempfile as _tf
-    with _tf.NamedTemporaryFile(delete=False, dir=tmp_dir, suffix=".tmp") as tf:
+    with _tf.NamedTemporaryFile(delete=False, dir=tmp_dir, suffix=tmp_suffix) as tf:
         tmp_path = tf.name
+    extra_tmp = tmp_path + target_ext if target_ext else None
     try:
         writer_fn(tmp_path)
-        os.replace(tmp_path, target_path)
+        actual_path = tmp_path
+        if not os.path.exists(actual_path) and extra_tmp and os.path.exists(extra_tmp):
+            actual_path = extra_tmp
+        if actual_path != tmp_path and os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except Exception: pass
+        os.replace(actual_path, target_path)
     except Exception:
-        try: os.remove(tmp_path)
-        except Exception: pass
+        for cand in (tmp_path, extra_tmp):
+            if not cand:
+                continue
+            try:
+                if os.path.exists(cand):
+                    os.remove(cand)
+            except Exception:
+                pass
         raise
 
 def _write_rgb_cache(path: str, arr: np.ndarray) -> None:
@@ -1289,11 +1304,15 @@ class TwoRadarFusionDataset(Dataset):
             out_av = []
             mask_t = None
             inten_t = None
+            clear_mask = (~atlas)
+            blocked_mask = ~clear_mask
+            clear_float = clear_mask.to(torch.float32)
             for i, ((mask, inten), av) in enumerate(zip(triplet, av_triplet)):
-                inten = inten.masked_fill(atlas, 0.0)
-                mask = mask.logical_and(~atlas)
+                inten = inten.masked_fill(blocked_mask, 0.0)
+                mask = mask.logical_and(clear_mask)
+                av = av.to(torch.float32) * clear_float
                 out_inten.append(inten)
-                out_av.append(av.to(torch.float32))
+                out_av.append(av)
                 if i == 1:
                     mask_t, inten_t = mask, inten
             return out_inten, out_av, mask_t, inten_t
@@ -1306,7 +1325,9 @@ class TwoRadarFusionDataset(Dataset):
         intenA, avA, maskA_t, intenA_t = proc_triplet([A_prev, A_t, A_next], [A_prev_av, A_t_av, A_next_av], atlas_A)
         intenB, avB, maskB_t, intenB_t = proc_triplet([B_prev, B_t, B_next], [B_prev_av, B_t_av, B_next_av], atlas_B)
         if self.dcfg.fuse_mode == "mean":
-            y_dbz = (intenA_t + intenB_t) * 0.5
+            avail_sum = A_t_av + B_t_av
+            denom = torch.where(avail_sum > 0, avail_sum, torch.ones_like(avail_sum))
+            y_dbz = (intenA_t * A_t_av + intenB_t * B_t_av) / denom
         else:
             y_dbz = torch.maximum(intenA_t, intenB_t)
         y_mask = maskA_t.logical_or(maskB_t)
@@ -1608,6 +1629,56 @@ def make_loaders(sources, device, rank, world_size, num_workers, prefetch_factor
     return dcfg, train_ds, val_ds, train_loader, val_loader, train_sampler, val_sampler
 
 # ===========================
+# SWA helpers
+# ===========================
+def _update_swa_bn_stats(train_ds, device, swa_model, batch_size, rank):
+    if swa_model is None or len(train_ds) == 0:
+        return
+    bn_modules = [m for m in swa_model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    if not bn_modules:
+        return
+    try:
+        from torch.optim.swa_utils import update_bn
+    except Exception:
+        return
+
+    was_training = swa_model.training
+
+    if (not ddp_is_dist()) or rank == 0:
+        loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(device.type == "cuda"),
+            drop_last=False,
+        )
+
+        class _BNLoaderWrapper:
+            def __init__(self, base_loader, device):
+                self.base_loader = base_loader
+                self.device = device
+
+            def __iter__(self):
+                non_blocking = (self.device.type == "cuda")
+                for batch in self.base_loader:
+                    x = batch["x"].to(self.device, non_blocking=non_blocking)
+                    yield x.contiguous(memory_format=torch.channels_last)
+
+            def __len__(self):
+                return len(self.base_loader)
+
+        wrapper = _BNLoaderWrapper(loader, device)
+        update_bn(wrapper, swa_model, device=device)
+
+    if ddp_is_dist() and dist.is_initialized():
+        for buf in swa_model.buffers():
+            dist.broadcast(buf, src=0)
+        dist.barrier()
+
+    swa_model.train(was_training)
+
+# ===========================
 # Training function
 # ===========================
 def run_training(hparams, device, rank, local_rank, world_size,
@@ -1837,6 +1908,8 @@ def run_training(hparams, device, rank, local_rank, world_size,
         vloss_ema = eval_model(True,  desc="Val EMA", do_tta=EVAL_TTA_TRAIN) if ema is not None else vloss_raw
         vloss_swa = float("inf")
         if (scheduler_kind == "cosine") and (swa_model is not None) and (epoch == epochs):
+            bn_bsz = getattr(train_loader, "batch_size", BATCH_SIZE) or BATCH_SIZE
+            _update_swa_bn_stats(train_ds, device, swa_model, bn_bsz, rank)
             vloss_swa = eval_model(False, which_model=swa_model, desc="Val SWA", do_tta=EVAL_TTA_FINAL)
         vloss = min(vloss_raw, vloss_ema, vloss_swa)
 
