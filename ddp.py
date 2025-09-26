@@ -76,7 +76,9 @@ try:
     WEAK_CACHE_LMDB_MAP_SIZE = int(os.environ.get("WEAK_CACHE_LMDB_MAP_SIZE", str(1 << 34)))
 except ValueError:
     WEAK_CACHE_LMDB_MAP_SIZE = 1 << 34
+_WEAK_CACHE_WRITE_FILES_ENV = os.environ.get("WEAK_CACHE_WRITE_FILES")
 WEAK_CACHE_WRITE_FILES = _env_flag("WEAK_CACHE_WRITE_FILES", True)
+WEAK_CACHE_WRITE_FILES_FORCED_ON = bool(_WEAK_CACHE_WRITE_FILES_ENV and WEAK_CACHE_WRITE_FILES)
 
 # RGB caching: "off" | "npy" | "npz"
 RGB_CACHE_MODE = "off"   # will be set to "npy" during cpu-prep when --fast-io/--do-rgb-cache
@@ -683,10 +685,23 @@ class WeakCacheStore:
 _WEAK_CACHE_STORE: Optional[WeakCacheStore] = None
 
 
+def _maybe_auto_disable_weak_files(store: Optional[WeakCacheStore]):
+    global WEAK_CACHE_WRITE_FILES
+    if not store or not store.enabled:
+        return
+    if WEAK_CACHE_WRITE_FILES_FORCED_ON:
+        return
+    if WEAK_CACHE_WRITE_FILES:
+        WEAK_CACHE_WRITE_FILES = False
+
+
 def get_weak_cache_store() -> Optional[WeakCacheStore]:
     global _WEAK_CACHE_STORE
     if _WEAK_CACHE_STORE is not None:
-        return _WEAK_CACHE_STORE if _WEAK_CACHE_STORE.enabled else None
+        store = _WEAK_CACHE_STORE if _WEAK_CACHE_STORE.enabled else None
+        if store:
+            _maybe_auto_disable_weak_files(store)
+        return store
     if WEAK_CACHE_BACKEND:
         try:
             _WEAK_CACHE_STORE = WeakCacheStore(
@@ -700,7 +715,10 @@ def get_weak_cache_store() -> Optional[WeakCacheStore]:
             _WEAK_CACHE_STORE = None
     else:
         _WEAK_CACHE_STORE = None
-    return _WEAK_CACHE_STORE if (_WEAK_CACHE_STORE and _WEAK_CACHE_STORE.enabled) else None
+    store = _WEAK_CACHE_STORE if (_WEAK_CACHE_STORE and _WEAK_CACHE_STORE.enabled) else None
+    if store:
+        _maybe_auto_disable_weak_files(store)
+    return store
 
 def _save_weak_npz(path: str, mask: np.ndarray, inten: np.ndarray):
     payload = _weak_record_components(mask, inten)
@@ -1874,6 +1892,8 @@ def stage_cpu_prep(args):
     os.environ.setdefault("OMP_NUM_THREADS", str(max(2, (os.cpu_count() or 2)//2)))
     print("🔧 CPU Prep Stage — indexing sources (and optional cache precompute)", flush=True)
 
+    store = get_weak_cache_store()
+
     # 1) FAST-IO (forced big/fast caches)
     if getattr(args, "fast_io", False):
         RGB_CACHE_MODE = "npy"          # bigger, faster
@@ -1897,10 +1917,18 @@ def stage_cpu_prep(args):
         if getattr(args, "weak_quant8", False):
             WEAK_INTEN_DTYPE = np.uint8  # quantize weak intensity to u8 inside .npz
 
+    store_status = "on" if store else "off"
+    if store and not WEAK_CACHE_WRITE_FILES:
+        files_status = "off (shared-store only)"
+    elif store:
+        files_status = "on (shared+files)"
+    else:
+        files_status = "on" if WEAK_CACHE_WRITE_FILES else "off"
+
     print(
         f"RGB_CACHE_MODE={RGB_CACHE_MODE} | weak: compress={WEAK_CACHE_COMPRESS} "
         f"packbits={WEAK_PACK_MASK_BITS} inten_dtype={'u8' if WEAK_INTEN_DTYPE is np.uint8 else 'f16'} "
-        f"files={'on' if WEAK_CACHE_WRITE_FILES else 'off'}",
+        f"shared-store={store_status} files={files_status}",
         flush=True
     )
 
@@ -2120,6 +2148,8 @@ def parse_args():
                help="Disable mask bit-packing (debug; larger)")
     p.add_argument("--no-weak-compress", action="store_true",
                help="Store weak cache as raw .npy instead of .npz (debug; larger)")
+    p.add_argument("--weak-cache-write-files", action="store_true",
+               help="Force legacy per-file weak-cache artifacts even when shared store is available")
     p.add_argument("--precompute-missing-only", action="store_true",
                    help="During cpu-prep, only build weak/RGB caches that are missing.")
     p.add_argument("--stop-on-error", action="store_true",
@@ -2130,6 +2160,9 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    if getattr(args, "weak_cache_write_files", False):
+        WEAK_CACHE_WRITE_FILES = True
+        WEAK_CACHE_WRITE_FILES_FORCED_ON = True
     requested_device = "cuda" if getattr(args, "prep_on_gpu", False) else "cpu"
     if requested_device != "cpu" and not torch.cuda.is_available():
         print("⚠️  --prep-on-gpu requested but CUDA is unavailable; falling back to CPU.", flush=True)
