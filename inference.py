@@ -383,12 +383,12 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
         state_dict = checkpoint.get("state_dict")
     if state_dict is None:
         state_dict = checkpoint
-    def _strip_prefix(sd: dict, prefix: str):
+    def _strip_prefix(sd: Any, prefix: str):
         if not isinstance(sd, dict) or not sd:
             return sd
         keys = list(sd.keys())
         if all(k.startswith(prefix) for k in keys):
-            return {k[len(prefix):]: v for k, v in sd.items()}
+            return type(sd)((k[len(prefix):], v) for k, v in sd.items())
         return sd
 
     # Handle wrappers such as torch.compile that prepend "_orig_mod." or DDP's "module.".
