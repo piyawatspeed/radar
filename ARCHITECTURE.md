@@ -1,42 +1,45 @@
 # Radar Cleaner Architecture Overview
 
 ## Top-Level Script Structure
-- **Single entry point (`ddp.py`)** orchestrates both preprocessing and training stages. The script exposes a CLI flag (`--stage`) that selects between a CPU-only preparation pipeline and a GPU/DistributedDataParallel (DDP) training run.【F:ddp.py†L1-L25】【F:ddp.py†L1143-L1269】
-- Global constants near the top of the file capture operational defaults for dataset paths, caching behavior, model hyperparameters, scheduler settings, and distributed knobs. CLI arguments can override many of these values at runtime.【F:ddp.py†L27-L221】【F:ddp.py†L1269-L1356】
+- **Single entry point (`ddp.py`)** orchestrates both preprocessing and training stages. A CLI switch (`--stage`) selects between a CPU preparation pipeline and the GPU/DDP training path, while shared configuration defaults live near the top of the script for easy override via command-line flags.【F:ddp.py†L1-L200】【F:ddp.py†L2603-L2674】
 
 ## Distributed Runtime Utilities
-- Helper functions (`ddp_env`, `ddp_setup`, `ddp_cleanup`, `is_main`) prepare PyTorch distributed state, choose an NCCL backend when CUDA is available, and gracefully tear down process groups. The utilities allow both single-process and multi-process runs to share the same control flow.【F:ddp.py†L223-L261】
-- `weighted_reduce_sum_count` performs an all-reduce over scalar loss and count accumulators so validation metrics can be averaged consistently across workers.【F:ddp.py†L263-L268】
+- Helper functions (`ddp_env`, `ddp_setup`, `ddp_cleanup`, `is_main`) prepare distributed state, choose an appropriate backend, and ensure process groups are torn down cleanly. `weighted_reduce_sum_count` performs cross-rank aggregation of scalar metrics so validation stays consistent under DDP.【F:ddp.py†L205-L241】
 
 ## Data Acquisition and Caching
-- Image discovery (`list_images`, `parse_timestamp`) and timestamp helpers convert between filename timestamps and `datetime` objects, enabling time-based neighbor lookups inside the dataset.【F:ddp.py†L210-L244】
-- RGB assets optionally flow through an `.npy`/`.npz` caching layer driven by `_rgb_cache_path` and `imread_rgb`. Timestamp-derived stems keep filenames stable across machines, caches are written atomically to avoid corruption, and operators can choose compressed (space-saving) or raw (fast I/O) modes.【F:ddp.py†L227-L294】
-- Weak label generation combines HSV thresholding, morphological cleanup, and configurable quantization/padding. `_weak_cache_key_base` derives a `WeakCacheKey` carrying the timestamp stem and parameter tokens so lookups can address either per-file caches or sharded backends. Legacy `.npz` payloads store their mask shape, allowing `_weak_record_from_arrays` to infer whether bit-packed masks need unpacking even when runtime bitpacking is disabled.【F:ddp.py†L296-L509】【F:ddp.py†L598-L757】【F:ddp.py†L470-L501】
-- `WeakCacheStore` bridges LMDB/Zarr/Parquet shards through a uniform interface. When a backend is configured (via `WEAK_CACHE_BACKEND`, `WEAK_CACHE_SHARD_BY`, and related environment toggles) weak-label reads flow through the shared store first and only fall back to legacy `.npz` files if a shard miss occurs. By default, per-file weak-cache writes are automatically suppressed once the shared store is active so only the shard is populated; operators can restore the legacy artifacts through `--weak-cache-write-files` or `WEAK_CACHE_WRITE_FILES=1` when that redundancy is desired.【F:ddp.py†L55-L111】【F:ddp.py†L598-L757】【F:ddp.py†L1833-L1959】【F:ddp.py†L2123-L2165】
-- Atlas building (`build_atlas_mask`, `_fit_mask_to`) summarizes static artifacts (e.g., radar occlusion regions) so downstream samples can zero out unusable pixels.【F:ddp.py†L537-L636】
+- Image discovery (`list_images`, `parse_timestamp`) and timestamp helpers convert filename tokens into sortable integers, enabling time-based neighbor lookups inside the dataset.【F:ddp.py†L243-L294】
+- RGB assets optionally flow through an `.npy`/`.npz` caching layer driven by `_rgb_cache_path` and `imread_rgb`. Timestamp-derived stems keep filenames stable across machines and caches are written atomically to avoid corruption.【F:ddp.py†L284-L360】
+- Weak label generation combines HSV thresholding, morphological cleanup, and configurable quantization/padding. `_weak_cache_key_base` and `WeakCacheStore` coordinate per-file artifacts with optional shared-store backends so recomputation can be skipped when caches already exist.【F:ddp.py†L296-L757】【F:ddp.py†L598-L757】【F:ddp.py†L1805-L1959】
+- Atlas building (`build_atlas_mask`, `_fit_mask_to`) summarizes static artifacts (e.g., ground clutter) so downstream samples can zero out unusable pixels.【F:ddp.py†L509-L636】
+
+## Geometry and Radar Alignment
+- `compute_center_px`, `compute_mpp`, and `build_warp_grid` derive uncropped radar centers, meters-per-pixel scaling, and the dense AEQD-based sampling grid used to reproject Radar B into Radar A’s pixel layout while accounting for the masked left strip.【F:ddp.py†L1070-L1135】
+- The dataset lazily loads (or regenerates) the cached warp grid, resizes it on demand, and applies it to Radar B’s intensity, availability, and mask channels prior to fusion so both sources are co-registered during training.【F:ddp.py†L1320-L1588】
+- During `cpu-prep`, enabling `--precompute-warp` rebuilds the dense warp against uncropped frame dimensions and logs the derived center, effective width, and meters-per-pixel metrics for traceability.【F:ddp.py†L2451-L2474】
 
 ## Dataset Pipeline
-- `SourceData` encapsulates per-radar metadata, including sorted timestamp indices, atlas masks, and maps from timestamps to file paths.【F:ddp.py†L638-L734】
-- `RadarDataset` synthesizes temporal triplets around a reference frame for two radar sources, fusing weak-label masks and intensities, handling cache lookups, performing random view augmentations, and returning tensors ready for training. It dynamically pads and crops samples to the configured crop size, ensuring consistent shapes for batching.【F:ddp.py†L736-L944】【F:ddp.py†L964-L1046】
-- Loader construction (`make_loaders`) builds deterministic train/validation splits, sets up `DistributedSampler` instances when running under DDP, and forwards user-tunable DataLoader parameters such as worker count and prefetch depth.【F:ddp.py†L1048-L1141】
+- `SourceData` encapsulates per-radar metadata, including sorted timestamp indices, atlas masks, and maps from timestamps to file paths.【F:ddp.py†L1170-L1239】
+- `TwoRadarFusionDataset` gathers temporal triplets for both radars, fuses weak-label masks and intensities, performs atlas gating, aligns Radar B via the cached warp, augments with helper channels, and prepares optional inpaint masks before padding/cropping for batching.【F:ddp.py†L1230-L1668】
+- Loader construction (`make_loaders`) builds deterministic train/validation splits, sets up `DistributedSampler` instances when running under DDP, and forwards user-tunable DataLoader parameters such as worker count and prefetch depth.【F:ddp.py†L1869-L1947】
 
 ## Model Definition
-- `TinyUNet` implements a lightweight encoder–decoder with GroupNorm. Building blocks (`ConvGNReLU`, `Down`, `Up`) provide reusable convolutional stages, while the network produces two heads: a segmentation mask and a reflectivity regression map.【F:ddp.py†L946-L1030】
+- `TinyUNet` implements a lightweight encoder–decoder with GroupNorm. Building blocks (`ConvGNReLU`, `Down`, `Up`) provide reusable convolutional stages, while the network produces two heads: a segmentation mask and a reflectivity regression map.【F:ddp.py†L1670-L1775】
 
 ## Losses and Regularization
-- `FocalBCE` and `dice_loss` target the mask output, blending focal cross-entropy with Dice stabilization. Smooth L1 regression handles the dBZ head, gated by positive mask pixels. Optional EMA and SWA modules smooth training dynamics and evaluation checkpoints.【F:ddp.py†L1032-L1117】【F:ddp.py†L1172-L1245】
+- `FocalBCE` and `dice_loss` target the mask output, blending focal cross-entropy with Dice stabilization. Smooth L1 regression handles the dBZ head, gated by positive mask pixels. Optional EMA and SWA modules smooth training dynamics and evaluation checkpoints.【F:ddp.py†L1032-L1117】【F:ddp.py†L2103-L2260】
 
-## Training Loop
-- `run_training` wires together optimizer creation, optional learning-rate finder sweeps, scheduler selection (OneCycle, Cosine with optional SWA, or Plateau), mixed-precision scaling, gradient clipping, EMA/SWA updates, validation passes, and checkpointing. Gradient accumulation is handled via a helper that ensures trailing micro-batches still trigger optimizer steps.【F:ddp.py†L1119-L1265】【F:ddp.py†L1185-L1239】
-- Validation leverages `_predict_tta` for optional test-time augmentation and aggregates metrics across distributed ranks with `weighted_reduce_sum_count`. Early stopping monitors validation loss and persists the best-performing state dict.【F:ddp.py†L1209-L1265】【F:ddp.py†L1265-L1337】
+## Inpaint Objective
+- The dataset can corrupt randomly sampled meteorology pixels (excluding the label strip and atlas-masked regions), zeroing the affected channels while emitting an `inpaint_mask` tensor that tracks hole locations for reconstruction supervision.【F:ddp.py†L1604-L1667】
+- Training and validation loops incorporate a masked L1 reconstruction loss weighted by `--inpaint-weight` whenever holes are present, and progress logging reports the running reconstruction loss when enabled.【F:ddp.py†L2144-L2244】
+- CLI flags (`--do-inpaint`, `--inpaint-frac`, `--inpaint-weight`) control whether the objective is active and its sampling density/weighting.【F:ddp.py†L2647-L2649】
 
 ## CPU Preparation Stage
-- `stage_cpu_prep` collects radar sources, configures cache formats (e.g., enabling fast I/O via `--fast-io`), and optionally precomputes weak labels and RGB caches in parallel with a `ProcessPoolExecutor`. When the shared store is active the workers insert freshly computed masks into the configured shard (e.g., day-buckets) so subsequent runs can reuse them without touching individual `.npz` files. Coverage reporting still reflects both store hits and disk artifacts, and strict reuse modes continue to forbid recomputation.【F:ddp.py†L1339-L1525】【F:ddp.py†L598-L757】
+- `stage_cpu_prep` collects radar sources, configures cache formats (e.g., enabling fast I/O via `--fast-io`), optionally precomputes weak labels/RGB caches in parallel, and can prebuild the dense warp grid. Coverage reporting still reflects both store hits and disk artifacts, and strict reuse modes continue to forbid recomputation.【F:ddp.py†L2384-L2585】
 
 ## GPU / DDP Training Stage
-- `stage_gpu_train` initializes distributed state, validates cache availability when strict modes are enabled, assembles loaders, and finally delegates to `run_training` with the currently active hyperparameter defaults. Cleanup ensures process groups and GPU memory are released at the end of the run.【F:ddp.py†L1527-L1605】
+- `stage_gpu_train` initializes distributed state, validates cache availability when strict modes are enabled, assembles loaders, and delegates to `run_training` with the active hyperparameter defaults. Cleanup ensures process groups and GPU memory are released at the end of the run.【F:ddp.py†L1949-L2098】
 
 ## Command-Line Interface
-- `parse_args` enumerates user-facing toggles for both stages, including cache policies, worker configuration, strictness flags, and paths. `main` applies overrides (e.g., updating global directories), selects the requested stage, and invokes the corresponding driver.【F:ddp.py†L1607-L1716】
+- `parse_args` enumerates user-facing toggles for both stages, including geometry overrides, cache policies, worker configuration, strictness flags, inpaint controls, and paths. `main` applies overrides (e.g., updating global directories), selects the requested stage, and invokes the corresponding driver.【F:ddp.py†L2603-L2674】
 
-This architecture keeps preprocessing and training in a single script while modularizing concerns—caching, dataset assembly, modeling, optimization, and distributed execution—so operators can switch between space-saving and performance-oriented workflows without modifying source code. Sharded weak-label storage extends those trade-offs, letting deployments choose between per-file caches and scalable shared stores by flipping environment variables rather than rewriting pipelines.【F:ddp.py†L55-L111】【F:ddp.py†L598-L757】
+This architecture keeps preprocessing and training in a single script while modularizing concerns—caching, dataset assembly, modeling, optimization, geometry alignment, and distributed execution—so operators can switch between space-saving and performance-oriented workflows without modifying source code.【F:ddp.py†L1-L200】【F:ddp.py†L1320-L1668】
