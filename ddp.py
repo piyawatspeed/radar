@@ -1588,9 +1588,11 @@ class TwoRadarFusionDataset(Dataset):
             intenB_t = intenB[1]
 
         if self.dcfg.fuse_mode == "mean":
-            avail_sum = A_t_av + B_t_av
+            availA_t = avA[1]
+            availB_t = avB[1]
+            avail_sum = availA_t + availB_t
             denom = torch.where(avail_sum > 0, avail_sum, torch.ones_like(avail_sum))
-            y_dbz = (intenA_t * A_t_av + intenB_t * B_t_av) / denom
+            y_dbz = (intenA_t * availA_t + intenB_t * availB_t) / denom
         else:
             y_dbz = torch.maximum(intenA_t, intenB_t)
         y_mask = maskA_t.logical_or(maskB_t)
