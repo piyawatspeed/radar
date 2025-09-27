@@ -8,7 +8,8 @@
 #   * --strict-atlas-only  -> never rebuild atlas; error on miss
 # - I/O perf:
 #   * pillow-simd friendly decode path; optional RGB npy cache to skip JPEG
-#   * weak caches use .npz with bitpack/float16 (or raw npy when --fast-io)
+#   * weak caches use .npz with bitpack/float16 (or raw npy when --fast-io) and
+#     auto-detect legacy bit-packed loads even if runtime bitpacking is off
 # - Train perf:
 #   * channels-last, cudnn.benchmark, non_blocking H2D, configurable workers/prefetch
 #   * AMP via torch.amp.*, optional torch.compile on Ampere+/Ada (L4 OK)
@@ -475,10 +476,14 @@ def _weak_record_from_arrays(z) -> Tuple[np.ndarray, np.ndarray]:
     H, W = map(int, z["shape"])
     m = z["mask"]
     iq8 = int(z["iq8"][0]) if "iq8" in getattr(z, "files", z) else 0
-    if WEAK_PACK_MASK_BITS and m.ndim == 2:
+
+    # Older caches may have been saved with bit-packed masks even if the current
+    # runtime has WEAK_PACK_MASK_BITS disabled. Rely on the stored tensor shape
+    # instead of the global flag so we can transparently read legacy artifacts.
+    if m.ndim == 2 and m.shape[1] != W:
         mask = np.unpackbits(m, axis=1)[:, :W].astype(bool)
     else:
-        mask = (m.astype(np.uint8) > 0)
+        mask = (np.asarray(m).astype(np.uint8) > 0)
     inten_raw = z["inten"]
     inten = (inten_raw.astype(np.float32) / 255.0) if iq8 else inten_raw.astype(np.float32)
     return mask, inten
