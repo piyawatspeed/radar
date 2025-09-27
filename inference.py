@@ -383,21 +383,18 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
         state_dict = checkpoint.get("state_dict")
     if state_dict is None:
         state_dict = checkpoint
-
-    def _strip_prefix(sd: Dict[str, Any], prefix: str):
+    def _strip_prefix(sd: dict, prefix: str):
         if not isinstance(sd, dict) or not sd:
             return sd
         keys = list(sd.keys())
         if all(k.startswith(prefix) for k in keys):
-            new_sd = OrderedDict()
-            for k, v in sd.items():
-                new_sd[k[len(prefix):]] = v
-            return new_sd
+            return {k[len(prefix):]: v for k, v in sd.items()}
         return sd
 
     # Handle wrappers such as torch.compile that prepend "_orig_mod." or DDP's "module.".
     state_dict = _strip_prefix(state_dict, "_orig_mod.")
     state_dict = _strip_prefix(state_dict, "module.")
+
     cfg: Dict[str, Any] = checkpoint.get("cfg") or checkpoint.get("config") or {}
 
     model_base = args.model_base if args.model_base is not None else cfg.get("base", 32)
