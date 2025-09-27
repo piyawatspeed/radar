@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import argparse
 import bisect
+from collections import OrderedDict
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
 
 import torch
+
+import ddp as training_cfg
 
 from ddp import (
     LEFT_MASK_PX,
@@ -264,6 +267,7 @@ def _process_radar_source(
     atlas: Optional[np.ndarray],
     image_shape: Tuple[int, int],
     hsvp: HSVParams,
+    left_mask_px: int,
     device: torch.device,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     height, width = image_shape
@@ -280,7 +284,7 @@ def _process_radar_source(
             availability = torch.zeros((height, width), dtype=torch.float32, device=device)
         else:
             img_rgb = _ensure_rgb(path)
-            _, inten_np = _weak_label_core(img_rgb, hsvp, LEFT_MASK_PX, device=str(device))
+            _, inten_np = _weak_label_core(img_rgb, hsvp, left_mask_px, device=str(device))
             intensity = torch.from_numpy(inten_np).to(device=device, dtype=torch.float32)
             if intensity.shape != (height, width):
                 raise ValueError(
@@ -344,16 +348,101 @@ def save_cleaned_image(cleaned_intensity: np.ndarray, out_path: str) -> None:
     image.save(out_path)
 
 
+def _apply_weak_label_config(cfg: Dict[str, Any]) -> HSVParams:
+    """Update ddp weak label globals and return HSV params to mirror training."""
+
+    mode = cfg.get("mode")
+    if mode:
+        training_cfg.WEAK_LABEL_MODE = mode
+
+    multi = cfg.get("multi_ranges")
+    if multi:
+        training_cfg.HSV_MULTI_RANGES = tuple((float(lo), float(hi)) for lo, hi in multi)
+
+    defaults = HSVParams()
+    simple_cfg = cfg.get("simple", {})
+    hue_lo = float(simple_cfg.get("hue_lo", defaults.hue_lo))
+    hue_hi = float(simple_cfg.get("hue_hi", defaults.hue_hi))
+    sat_min = float(simple_cfg.get("sat_min", defaults.sat_min))
+    val_min = float(simple_cfg.get("val_min", defaults.val_min))
+    training_cfg.HSV_H_LO = hue_lo
+    training_cfg.HSV_H_HI = hue_hi
+    training_cfg.HSV_S_MIN = sat_min
+    training_cfg.HSV_V_MIN = val_min
+    return HSVParams(hue_lo=hue_lo, hue_hi=hue_hi, sat_min=sat_min, val_min=val_min)
+
+
 def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA device requested but CUDA is not available.")
 
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    state_dict = checkpoint.get("model")
+    if state_dict is None:
+        state_dict = checkpoint.get("state_dict")
+    if state_dict is None:
+        state_dict = checkpoint
+
+    def _strip_prefix(sd: Dict[str, Any], prefix: str):
+        if not isinstance(sd, dict) or not sd:
+            return sd
+        keys = list(sd.keys())
+        if all(k.startswith(prefix) for k in keys):
+            new_sd = OrderedDict()
+            for k, v in sd.items():
+                new_sd[k[len(prefix):]] = v
+            return new_sd
+        return sd
+
+    # Handle wrappers such as torch.compile that prepend "_orig_mod." or DDP's "module.".
+    state_dict = _strip_prefix(state_dict, "_orig_mod.")
+    state_dict = _strip_prefix(state_dict, "module.")
+    cfg: Dict[str, Any] = checkpoint.get("cfg") or checkpoint.get("config") or {}
+
+    model_base = args.model_base if args.model_base is not None else cfg.get("base", 32)
+    args.model_base = model_base
+    in_ch = int(cfg.get("in_ch", 15))
+    if in_ch != 15:
+        raise ValueError(f"Unsupported checkpoint input channels {in_ch}; expected 15.")
+
+    left_mask_px = int(cfg.get("left_mask_px", LEFT_MASK_PX))
+    weak_cfg = cfg.get("weak_label", {})
+    hsvp = _apply_weak_label_config(weak_cfg)
+
+    if args.neighbor_minutes is None:
+        args.neighbor_minutes = int(cfg.get("neighbor_minutes", NEIGHBOR_MINUTES))
+
     # Build timestamp indices and gather neighbors
     index_a = TimestampIndex(args.radar_a)
     index_b = TimestampIndex(args.radar_b)
-    paths_a = index_a.neighbor_triplet(args.timestamp, args.neighbor_minutes)
-    paths_b = index_b.neighbor_triplet(args.timestamp, args.neighbor_minutes)
+    anchor_ts = args.timestamp
+    paths_a = index_a.neighbor_triplet(anchor_ts, args.neighbor_minutes)
+    paths_b = index_b.neighbor_triplet(anchor_ts, args.neighbor_minutes)
+
+    if paths_a[1] is None and paths_b[1] is None:
+        step = max(1, args.neighbor_minutes)
+        tol_center = MIN_TOL_MINUTES
+        shifted = False
+        for delta in range(step, step * 5, step):
+            for direction in (1, -1):
+                candidate_ts = add_minutes(anchor_ts, delta * direction)
+                has_center_a = index_a.find_within(candidate_ts, tol_center) is not None
+                has_center_b = index_b.find_within(candidate_ts, tol_center) is not None
+                if has_center_a or has_center_b:
+                    anchor_ts = candidate_ts
+                    paths_a = index_a.neighbor_triplet(anchor_ts, args.neighbor_minutes)
+                    paths_b = index_b.neighbor_triplet(anchor_ts, args.neighbor_minutes)
+                    shifted = True
+                    break
+            if shifted:
+                print(
+                    "Both radars missing center frame; "
+                    f"shifted anchor from {args.timestamp} to {anchor_ts}"
+                )
+                break
+
+    args.anchor_timestamp = anchor_ts
 
     # Determine shared image shape
     image_shape = _infer_image_shape(paths_a + paths_b)
@@ -362,11 +451,8 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
     atlas_a = _load_atlas(args.atlas_a, image_shape)
     atlas_b = _load_atlas(args.atlas_b, image_shape)
 
-    # Mirror the HSV filtering configuration from training.
-    hsvp = HSVParams()
-
-    inten_a, avail_a = _process_radar_source(paths_a, atlas_a, image_shape, hsvp, device)
-    inten_b, avail_b = _process_radar_source(paths_b, atlas_b, image_shape, hsvp, device)
+    inten_a, avail_a = _process_radar_source(paths_a, atlas_a, image_shape, hsvp, left_mask_px, device)
+    inten_b, avail_b = _process_radar_source(paths_b, atlas_b, image_shape, hsvp, left_mask_px, device)
 
     all_channels: List[torch.Tensor] = []
     all_channels.extend(inten_a)
@@ -383,11 +469,9 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
     input_tensor = input_tensor.to(device=device).contiguous(memory_format=torch.channels_last)
 
     # Load model
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
-    model = TinyUNet(in_ch=15, base=args.model_base)
+    model = TinyUNet(in_ch=in_ch, base=model_base)
     model.load_state_dict(state_dict)
-    model.to(device)
+    model = model.to(device).to(memory_format=torch.channels_last)
     model.eval()
 
     with torch.no_grad():
@@ -428,8 +512,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Directory to search for atlas files when --atlas-a/--atlas-b are not provided.",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--neighbor-minutes", type=int, default=NEIGHBOR_MINUTES)
-    parser.add_argument("--model-base", type=int, default=32, help="Base channel width (must match training).")
+    parser.add_argument(
+        "--neighbor-minutes",
+        type=int,
+        default=None,
+        help="Neighbor spacing in minutes (default: value saved in checkpoint or training default).",
+    )
+    parser.add_argument(
+        "--model-base",
+        type=int,
+        default=None,
+        help="Base channel width (default: value saved in checkpoint).",
+    )
     parser.add_argument("--out-mask", help="Output .npy path for probability mask (default: outputs/mask_<ts>.npy).")
     parser.add_argument(
         "--out-intensity",
@@ -477,10 +571,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         args.out_cleaned_image = str(output_dir / f"cleaned_{timestamp}.png")
 
     prob_mask_np, cleaned_intensity_np = run_inference(args)
+    anchor_ts = getattr(args, "anchor_timestamp", args.timestamp)
     message = (
         "Successfully generated prediction. Mask shape: "
         f"{prob_mask_np.shape}, intensity shape: {cleaned_intensity_np.shape}"
     )
+    if anchor_ts != args.timestamp:
+        message += f". Anchor timestamp adjusted to {anchor_ts}"
     if args.out_cleaned_image:
         message += f". Cleaned image saved to {args.out_cleaned_image}"
     print(message)
