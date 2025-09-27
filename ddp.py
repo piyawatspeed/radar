@@ -19,7 +19,7 @@
 #   train (strict):  python ddp.py --stage gpu-train --strict-cache-only --strict-atlas-only --radar-dirs /path/njk,/path/nkm --cache-root /big/cache
 
 from __future__ import annotations
-import os, re, glob, math, time, random, gc, contextlib, bisect, argparse, io, hashlib, threading, queue
+import os, re, glob, math, time, random, gc, contextlib, bisect, argparse, io, hashlib
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Iterable, Any
 from datetime import datetime, timedelta
@@ -2118,69 +2118,17 @@ def stage_cpu_prep(args):
         work = [(p, LEFT_MASK_PX, hsvp, args.do_rgb_cache, WEAK_LABEL_DEVICE) for p in todo_paths]
 
         errors = []
-        use_cuda_prep = (
-            WEAK_LABEL_DEVICE is not None
-            and str(WEAK_LABEL_DEVICE).startswith("cuda")
-            and torch.cuda.is_available()
-        )
+        max_workers = args.prep_workers or max(1, (os.cpu_count() or 2) - 1)
+        omp_per_worker = max(1, args.omp_per_worker)
+        print(f"🧵 Spawning {max_workers} workers (OMP threads/worker={omp_per_worker}) on {len(work)} files", flush=True)
 
-        if use_cuda_prep:
-            total_files = len(work)
-            print(
-                f"🚀 GPU weak-label pipeline on {WEAK_LABEL_DEVICE} (decode thread + GPU worker) for {total_files} files",
-                flush=True,
-            )
-            if total_files > 0:
-                decode_queue = queue.Queue(maxsize=2)
-                sentinel = object()
-
-                def _decode_worker():
-                    for task in work:
-                        path = task[0]
-                        try:
-                            img = imread_rgb(path)
-                        except Exception as e:
-                            decode_queue.put(("error", path, repr(e)))
-                            continue
-                        decode_queue.put(("data", task, img))
-                    decode_queue.put((sentinel, None, None))
-
-                decoder = threading.Thread(target=_decode_worker, name="weak-prep-decode", daemon=True)
-                decoder.start()
-
-                pbar = tqdm(total=total_files, dynamic_ncols=True, mininterval=0.1, miniters=1)
-                while True:
-                    item = decode_queue.get()
-                    tag = item[0]
-                    if tag is sentinel:
-                        break
-                    if tag == "error":
-                        _, path, msg = item
-                        errors.append((path, msg))
-                        pbar.update(1)
-                        continue
-                    _, task, img = item
-                    path, left_mask_px, task_hsvp, do_rgb, device = task
-                    try:
-                        _prep_single(path, left_mask_px, task_hsvp, do_rgb, device, predecoded=img)
-                    except Exception as e:
-                        errors.append((path, repr(e)))
-                    finally:
-                        pbar.update(1)
-                decoder.join()
-                pbar.close()
-        else:
-            max_workers = args.prep_workers or max(1, (os.cpu_count() or 2) - 1)
-            omp_per_worker = max(1, args.omp_per_worker)
-            print(f"🧵 Spawning {max_workers} workers (OMP threads/worker={omp_per_worker}) on {len(work)} files", flush=True)
-
-            with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(omp_per_worker,)) as ex:
-                fut_map = {ex.submit(_prep_single, *task): task[0] for task in work}
-                for fut in tqdm(as_completed(fut_map), total=len(fut_map), dynamic_ncols=True, mininterval=0.1, miniters=1):
-                    try:
-                        fut.result()  # <- surface exceptions!
-                    except Exception as e:
-                        errors.append((fut_map[fut], repr(e)))
+        with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(omp_per_worker,)) as ex:
+            fut_map = {ex.submit(_prep_single, *task): task[0] for task in work}
+            for fut in tqdm(as_completed(fut_map), total=len(fut_map), dynamic_ncols=True, mininterval=0.1, miniters=1):
+                try:
+                    fut.result()  # <- surface exceptions!
+                except Exception as e:
+                    errors.append((fut_map[fut], repr(e)))
 
         if errors:
             print(f"⚠️  {len(errors)} files failed during precompute. Showing up to 10:", flush=True)
@@ -2273,7 +2221,6 @@ def parse_args():
     p.add_argument("--prep-workers", type=int, default=None, help="CPU-prep parallel workers (default: cpu_count-1)")
     p.add_argument("--omp-per-worker", type=int, default=1, help="OpenMP/MKL threads per worker")
     p.add_argument("--fast-io", action="store_true", help="Use faster, larger caches (RGB npy, no weak compress/bitpack)")
-    p.add_argument("--prep-on-gpu", action="store_true", help="Run weak-label prep on GPU when available")
     # Shared paths
     p.add_argument("--radar-dirs", type=str, default=None, help="Comma-separated radar folders, e.g. /data/njk,/data/nkm")
     p.add_argument("--work-dir", type=str, default=os.environ.get("WORK_DIR", WORK_DIR), help="Where to save checkpoints/logs")
@@ -2306,14 +2253,6 @@ if __name__ == "__main__":
     if getattr(args, "weak_cache_write_files", False):
         WEAK_CACHE_WRITE_FILES = True
         WEAK_CACHE_WRITE_FILES_FORCED_ON = True
-    requested_device = "cuda" if getattr(args, "prep_on_gpu", False) else "cpu"
-    if requested_device != "cpu" and not torch.cuda.is_available():
-        print("⚠️  --prep-on-gpu requested but CUDA is unavailable; falling back to CPU.", flush=True)
-        requested_device = "cpu"
-    WEAK_LABEL_DEVICE = requested_device
-    if WEAK_LABEL_DEVICE != "cpu":
-        print(f"🖥️  Weak-label preprocessing device: {WEAK_LABEL_DEVICE}", flush=True)
-
     if args.radar_dirs:
         RADAR_DIRS[:] = [p.strip() for p in args.radar_dirs.split(",") if p.strip()]
     WORK_DIR = args.work_dir
