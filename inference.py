@@ -1,0 +1,490 @@
+"""Inference script for radar cleaning TinyUNet model.
+
+This utility mirrors the preprocessing steps used during training so that
+predictions can be generated from raw radar RGB frames.  It assembles the
+15-channel input tensor (6 intensity channels, 6 availability channels, and
+3 helper channels) for a target timestamp, runs the trained TinyUNet model,
+and optionally saves the probability mask and cleaned reflectivity maps.
+"""
+from __future__ import annotations
+
+import argparse
+import bisect
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
+from PIL import Image
+
+import torch
+
+from ddp import (
+    LEFT_MASK_PX,
+    MIN_TOL_MINUTES,
+    NEIGHBOR_MINUTES,
+    TOL_FRAC,
+    HSVParams,
+    TinyUNet,
+    _load_bool_mask_npz,
+    _weak_label_core,
+    add_minutes,
+    helper_channels,
+    list_images,
+    parse_timestamp,
+    ts_to_dt,
+)
+
+
+def _ensure_rgb(path: str) -> np.ndarray:
+    """Read an image file as an RGB numpy array."""
+    with Image.open(path) as img:
+        return np.asarray(img.convert("RGB"))
+
+
+DEFAULT_DATA_DIR = Path("data")
+DEFAULT_CHECKPOINT_DIR = Path("checkpoints")
+DEFAULT_ATLAS_DIR = Path("atlas")
+DEFAULT_OUTPUT_DIR = Path("outputs")
+DEFAULT_CHECKPOINT_PATTERN = "*.pt"
+DEFAULT_ATLAS_PATTERN = "*.npz"
+
+
+def _minutes_diff(ts_a: int, ts_b: int) -> float:
+    dt_a = ts_to_dt(ts_a)
+    dt_b = ts_to_dt(ts_b)
+    return abs((dt_a - dt_b).total_seconds() / 60.0)
+
+
+class TimestampIndex:
+    """Lightweight timestamp index for a radar source."""
+
+    def __init__(self, root: str):
+        paths = list_images(root)
+        items: List[Tuple[int, str]] = []
+        for path in paths:
+            ts = parse_timestamp(path)
+            if ts is not None:
+                items.append((ts, path))
+        if not items:
+            raise RuntimeError(
+                f"No timestamped images were found in '{root}'. "
+                "Filenames must contain YYYYMMDDHHMM."
+            )
+        items.sort(key=lambda pair: pair[0])
+        self.root = root
+        self._items = items
+        self.ts_sorted = [ts for ts, _ in items]
+        self.ts_to_path = {ts: path for ts, path in items}
+
+    def find_within(self, target_ts: int, tol_minutes: int) -> Optional[int]:
+        """Return the timestamp closest to *target_ts* within the tolerance."""
+        if target_ts in self.ts_to_path:
+            return target_ts
+
+        ts_sorted = self.ts_sorted
+        idx = bisect.bisect_left(ts_sorted, target_ts)
+        n = len(ts_sorted)
+        best_ts: Optional[int] = None
+        best_dt = float("inf")
+
+        left = idx - 1
+        right = idx
+
+        while left >= 0 or right < n:
+            advanced = False
+
+            if right < n:
+                ts = ts_sorted[right]
+                dt_min = _minutes_diff(ts, target_ts)
+                if dt_min <= tol_minutes:
+                    advanced = True
+                    if dt_min < best_dt:
+                        best_dt = dt_min
+                        best_ts = ts
+                    right += 1
+                else:
+                    right = n
+
+            if left >= 0:
+                ts = ts_sorted[left]
+                dt_min = _minutes_diff(ts, target_ts)
+                if dt_min <= tol_minutes:
+                    advanced = True
+                    if dt_min < best_dt:
+                        best_dt = dt_min
+                        best_ts = ts
+                    left -= 1
+                else:
+                    left = -1
+
+            if not advanced:
+                break
+
+        return best_ts
+
+    def neighbor_triplet(self, target_ts: int, neighbor_minutes: int = NEIGHBOR_MINUTES) -> List[Optional[str]]:
+        """Return the (prev, current, next) image paths around *target_ts*."""
+        offsets = (-neighbor_minutes, 0, neighbor_minutes)
+        paths: List[Optional[str]] = []
+        for offset in offsets:
+            seek_ts = add_minutes(target_ts, offset)
+            tol_base = neighbor_minutes if offset == 0 else abs(offset)
+            tol = max(MIN_TOL_MINUTES, int(tol_base * TOL_FRAC))
+            ts_match = self.find_within(seek_ts, tol)
+            paths.append(self.ts_to_path.get(ts_match) if ts_match is not None else None)
+        return paths
+
+
+def _validate_dir(path: Path, description: str) -> Path:
+    if not path.exists():
+        raise FileNotFoundError(f"{description} '{path}' does not exist.")
+    if not path.is_dir():
+        raise NotADirectoryError(f"{description} '{path}' is not a directory.")
+    return path
+
+
+def _discover_radar_dirs(
+    data_root: Path,
+    radar_a_override: Optional[str],
+    radar_b_override: Optional[str],
+) -> Tuple[Path, Path]:
+    data_root = _validate_dir(data_root, "Data root")
+
+    def _resolve_override(override: Optional[str]) -> Optional[Path]:
+        if override is None:
+            return None
+        path = Path(override)
+        if not path.is_absolute():
+            candidate = data_root / path
+            path = candidate if candidate.exists() else path
+        return _validate_dir(path, "Radar directory")
+
+    resolved_a = _resolve_override(radar_a_override)
+    resolved_b = _resolve_override(radar_b_override)
+
+    remaining = [p for p in sorted(data_root.iterdir()) if p.is_dir()]
+
+    def _pick_default(label: str, existing: Optional[Path]) -> Path:
+        if existing is not None:
+            return existing
+        while remaining:
+            candidate = remaining.pop(0)
+            if candidate != resolved_a and candidate != resolved_b:
+                return candidate
+        raise RuntimeError(
+            f"Unable to locate a default directory for Radar {label.upper()} in '{data_root}'."
+        )
+
+    radar_a = _pick_default("a", resolved_a)
+    radar_b = _pick_default("b", resolved_b)
+    return radar_a, radar_b
+
+
+def _discover_checkpoint(checkpoint: Optional[str], checkpoint_dir: Path) -> Path:
+    if checkpoint is not None:
+        path = Path(checkpoint)
+        if not path.is_absolute():
+            candidate = checkpoint_dir / path
+            if candidate.exists():
+                path = candidate
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint '{path}' does not exist.")
+        return path
+
+    checkpoint_dir = _validate_dir(checkpoint_dir, "Checkpoint directory")
+    matches = sorted(checkpoint_dir.glob(DEFAULT_CHECKPOINT_PATTERN))
+    if not matches:
+        raise RuntimeError(
+            f"No checkpoint matching '{DEFAULT_CHECKPOINT_PATTERN}' found in '{checkpoint_dir}'."
+        )
+    return matches[0]
+
+
+def _discover_atlases(
+    atlas_a: Optional[str],
+    atlas_b: Optional[str],
+    atlas_dir: Path,
+) -> Tuple[Optional[Path], Optional[Path]]:
+    def _resolve(path_str: Optional[str]) -> Optional[Path]:
+        if path_str is None:
+            return None
+        path = Path(path_str)
+        if not path.is_absolute():
+            candidate = atlas_dir / path
+            if candidate.exists():
+                path = candidate
+        if not path.exists():
+            raise FileNotFoundError(f"Atlas '{path}' does not exist.")
+        if not path.is_file():
+            raise RuntimeError(f"Atlas '{path}' is not a file.")
+        return path
+
+    resolved_a = _resolve(atlas_a)
+    resolved_b = _resolve(atlas_b)
+
+    if resolved_a is not None or resolved_b is not None:
+        return resolved_a, resolved_b
+
+    if not atlas_dir.exists():
+        return None, None
+    if not atlas_dir.is_dir():
+        raise NotADirectoryError(f"Atlas directory '{atlas_dir}' is not a directory.")
+
+    matches = sorted(atlas_dir.glob(DEFAULT_ATLAS_PATTERN))
+    if not matches:
+        return None, None
+    if len(matches) == 1:
+        return matches[0], None
+    return matches[0], matches[1]
+
+
+def _infer_image_shape(paths: Sequence[Optional[str]]) -> Tuple[int, int]:
+    for path in paths:
+        if path is None:
+            continue
+        with Image.open(path) as img:
+            h, w = img.size[1], img.size[0]
+            return h, w
+    raise RuntimeError("Unable to determine image dimensions from provided paths.")
+
+
+def _load_atlas(atlas_path: Optional[str], expected_shape: Tuple[int, int]) -> Optional[np.ndarray]:
+    if not atlas_path:
+        return None
+    atlas = _load_bool_mask_npz(atlas_path)
+    if atlas.shape != expected_shape:
+        raise ValueError(
+            f"Atlas at '{atlas_path}' has shape {atlas.shape}, expected {expected_shape}."
+        )
+    return atlas
+
+
+def _process_radar_source(
+    paths: Sequence[Optional[str]],
+    atlas: Optional[np.ndarray],
+    image_shape: Tuple[int, int],
+    hsvp: HSVParams,
+    device: torch.device,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    height, width = image_shape
+    atlas_torch: Optional[torch.Tensor] = None
+    if atlas is not None:
+        atlas_torch = torch.from_numpy(atlas.astype(np.bool_)).to(device)
+
+    intensity_channels: List[torch.Tensor] = []
+    availability_channels: List[torch.Tensor] = []
+
+    for path in paths:
+        if path is None:
+            intensity = torch.zeros((height, width), dtype=torch.float32, device=device)
+            availability = torch.zeros((height, width), dtype=torch.float32, device=device)
+        else:
+            img_rgb = _ensure_rgb(path)
+            _, inten_np = _weak_label_core(img_rgb, hsvp, LEFT_MASK_PX, device=str(device))
+            intensity = torch.from_numpy(inten_np).to(device=device, dtype=torch.float32)
+            if intensity.shape != (height, width):
+                raise ValueError(
+                    f"Intensity shape {intensity.shape} from '{path}' does not match expected {(height, width)}."
+                )
+            if atlas_torch is not None:
+                intensity = intensity.clone()
+                intensity.masked_fill_(atlas_torch, 0.0)
+            availability = torch.ones((height, width), dtype=torch.float32, device=device)
+            if atlas_torch is not None:
+                availability = availability.clone()
+                availability.masked_fill_(atlas_torch, 0.0)
+        intensity_channels.append(intensity)
+        availability_channels.append(availability)
+
+    return intensity_channels, availability_channels
+
+
+def _intensity_to_radar_rgb(cleaned_intensity: np.ndarray) -> np.ndarray:
+    """Convert normalized intensities into the provided discrete radar palette."""
+
+    if cleaned_intensity.ndim != 2:
+        raise ValueError(
+            "Cleaned intensity must be a 2D array to convert to RGB; "
+            f"got shape {cleaned_intensity.shape}."
+        )
+
+    scaled = np.clip(cleaned_intensity, 0.0, 1.0)
+
+    # Convert to dBZ assuming the palette maxes out at 76.67 dBZ.
+    dbz_max = 76.67
+    dbz_values = scaled.reshape(-1) * dbz_max
+
+    # Discrete color bins supplied by the user. Each tuple is (high_edge, (R, G, B)).
+    color_bins = np.array([11.76, 34.09, 53.64, 55.29, 55.99, 75.28], dtype=np.float32)
+    colors = np.array(
+        [
+            (8, 9, 235),    # 9.5-11.76 dBZ
+            (12, 198, 18),  # 12.37-34.09 dBZ
+            (230, 176, 12), # 34.09-53.64 dBZ
+            (232, 8, 9),    # 53.64-55.29 dBZ
+            (229, 7, 27),   # 55.29-55.99 dBZ
+            (231, 85, 178), # 55.99-75.28 dBZ
+            (249, 249, 248) # 75.88-76.67 dBZ
+        ],
+        dtype=np.float32,
+    )
+
+    # Assign each pixel to a palette color.
+    indices = np.digitize(dbz_values, color_bins, right=True)
+    indices = np.clip(indices, 0, len(colors) - 1)
+    rgb = colors[indices].reshape((*scaled.shape, 3))
+    return rgb.astype(np.uint8)
+
+
+def save_cleaned_image(cleaned_intensity: np.ndarray, out_path: str) -> None:
+    """Persist the cleaned intensity map as a radar-style color image."""
+
+    rgb = _intensity_to_radar_rgb(cleaned_intensity)
+    image = Image.fromarray(rgb, mode="RGB")
+    image.save(out_path)
+
+
+def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA device requested but CUDA is not available.")
+
+    # Build timestamp indices and gather neighbors
+    index_a = TimestampIndex(args.radar_a)
+    index_b = TimestampIndex(args.radar_b)
+    paths_a = index_a.neighbor_triplet(args.timestamp, args.neighbor_minutes)
+    paths_b = index_b.neighbor_triplet(args.timestamp, args.neighbor_minutes)
+
+    # Determine shared image shape
+    image_shape = _infer_image_shape(paths_a + paths_b)
+
+    # Load atlases if provided
+    atlas_a = _load_atlas(args.atlas_a, image_shape)
+    atlas_b = _load_atlas(args.atlas_b, image_shape)
+
+    # Mirror the HSV filtering configuration from training.
+    hsvp = HSVParams()
+
+    inten_a, avail_a = _process_radar_source(paths_a, atlas_a, image_shape, hsvp, device)
+    inten_b, avail_b = _process_radar_source(paths_b, atlas_b, image_shape, hsvp, device)
+
+    all_channels: List[torch.Tensor] = []
+    all_channels.extend(inten_a)
+    all_channels.extend(inten_b)
+    all_channels.extend(avail_a)
+    all_channels.extend(avail_b)
+
+    r_norm, cos_t, sin_t = helper_channels(*image_shape)
+    all_channels.append(torch.from_numpy(r_norm).to(device=device, dtype=torch.float32))
+    all_channels.append(torch.from_numpy(cos_t).to(device=device, dtype=torch.float32))
+    all_channels.append(torch.from_numpy(sin_t).to(device=device, dtype=torch.float32))
+
+    input_tensor = torch.stack(all_channels, dim=0).unsqueeze(0)
+    input_tensor = input_tensor.to(device=device).contiguous(memory_format=torch.channels_last)
+
+    # Load model
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+    model = TinyUNet(in_ch=15, base=args.model_base)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+
+    with torch.no_grad():
+        logits_mask, dbz_pred = model(input_tensor)
+        prob_mask = torch.sigmoid(logits_mask)
+        cleaned_intensity = torch.clamp(dbz_pred, 0.0, 1.0)
+
+    prob_mask_np = prob_mask.squeeze().detach().cpu().numpy()
+    cleaned_intensity_np = cleaned_intensity.squeeze().detach().cpu().numpy()
+
+    if args.out_mask:
+        np.save(args.out_mask, prob_mask_np)
+    if args.out_intensity:
+        np.save(args.out_intensity, cleaned_intensity_np)
+    if args.out_cleaned_image:
+        save_cleaned_image(cleaned_intensity_np, args.out_cleaned_image)
+
+    return prob_mask_np, cleaned_intensity_np
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run TinyUNet radar inference.")
+    parser.add_argument("timestamp", type=int, help="Target timestamp YYYYMMDDHHMM.")
+    parser.add_argument("--radar-a", help="Directory with Radar A frames (default: auto-detected in data root).")
+    parser.add_argument("--radar-b", help="Directory with Radar B frames (default: auto-detected in data root).")
+    parser.add_argument("--data-root", default=str(DEFAULT_DATA_DIR), help="Root directory containing radar data.")
+    parser.add_argument("--checkpoint", help="Path to the trained model checkpoint (.pt).")
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=str(DEFAULT_CHECKPOINT_DIR),
+        help="Directory to search for a checkpoint when --checkpoint is not provided.",
+    )
+    parser.add_argument("--atlas-a", help="Optional atlas mask (.npz) for Radar A.")
+    parser.add_argument("--atlas-b", help="Optional atlas mask (.npz) for Radar B.")
+    parser.add_argument(
+        "--atlas-dir",
+        default=str(DEFAULT_ATLAS_DIR),
+        help="Directory to search for atlas files when --atlas-a/--atlas-b are not provided.",
+    )
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--neighbor-minutes", type=int, default=NEIGHBOR_MINUTES)
+    parser.add_argument("--model-base", type=int, default=32, help="Base channel width (must match training).")
+    parser.add_argument("--out-mask", help="Output .npy path for probability mask (default: outputs/mask_<ts>.npy).")
+    parser.add_argument(
+        "--out-intensity",
+        help="Output .npy path for cleaned intensity (default: outputs/intensity_<ts>.npy).",
+    )
+    parser.add_argument(
+        "--out-cleaned-image",
+        help="Output image file (default: outputs/cleaned_<ts>.png) for the cleaned intensity map.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Directory to place default outputs when explicit paths are not provided.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = parse_args(argv)
+
+    timestamp = args.timestamp
+
+    data_root = Path(args.data_root)
+    radar_a_dir, radar_b_dir = _discover_radar_dirs(data_root, args.radar_a, args.radar_b)
+    args.radar_a = str(radar_a_dir)
+    args.radar_b = str(radar_b_dir)
+
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_path = _discover_checkpoint(args.checkpoint, checkpoint_dir)
+    args.checkpoint = str(checkpoint_path)
+
+    atlas_dir = Path(args.atlas_dir)
+    atlas_a_path, atlas_b_path = _discover_atlases(args.atlas_a, args.atlas_b, atlas_dir)
+    args.atlas_a = str(atlas_a_path) if atlas_a_path is not None else None
+    args.atlas_b = str(atlas_b_path) if atlas_b_path is not None else None
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.out_mask is None:
+        args.out_mask = str(output_dir / f"mask_{timestamp}.npy")
+    if args.out_intensity is None:
+        args.out_intensity = str(output_dir / f"intensity_{timestamp}.npy")
+    if args.out_cleaned_image is None:
+        args.out_cleaned_image = str(output_dir / f"cleaned_{timestamp}.png")
+
+    prob_mask_np, cleaned_intensity_np = run_inference(args)
+    message = (
+        "Successfully generated prediction. Mask shape: "
+        f"{prob_mask_np.shape}, intensity shape: {cleaned_intensity_np.shape}"
+    )
+    if args.out_cleaned_image:
+        message += f". Cleaned image saved to {args.out_cleaned_image}"
+    print(message)
+
+
+if __name__ == "__main__":
+    main()
