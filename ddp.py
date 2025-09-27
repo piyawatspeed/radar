@@ -29,6 +29,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 from PIL import Image, ImageFile  # pillow-simd will override if installed
 
+from pyproj import Transformer
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -50,9 +52,18 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True  # tolerate slightly damaged JPEGs
 # USER CONFIG (DEFAULTS)
 # ===========================
 RADAR_DIRS = [
-    "/teamspace/studios/this_studio/15mins/njk",  # Radar A
-    "/teamspace/studios/this_studio/15mins/nkm",  # Radar B
+    "/teamspace/studios/this_studio/15mins/nkm",  # Radar A (NKM)
+    "/teamspace/studios/this_studio/15mins/njk",  # Radar B (NJK)
 ]
+RADAR_A_ID = "NKM"
+RADAR_B_ID = "NJK"
+RADAR_A_LATLON = (13.737729372744127, 100.3588712604009)
+RADAR_B_LATLON = (13.834873535452727, 100.84641070939088)
+RADAR_A_RANGE_KM = 120.0
+RADAR_B_RANGE_KM = 120.0
+RADAR_A_CENTER_OVERRIDE = None
+RADAR_B_CENTER_OVERRIDE = None
+WARP_CACHE_BASENAME = "warp_B_to_A.npy"
 TIMESTAMP_REGEX = r"(\d{12})(?=\D*$)"   # matches YYYYMMDDHHMM in filenames
 
 # Where to save results & caches
@@ -62,6 +73,10 @@ CACHE_DIR = os.path.join(CACHE_ROOT, "cache")             # weak-label/atlas cac
 RGB_CACHE_DIR = os.path.join(CACHE_ROOT, "img_npy_cache") # RGB caches
 for _d in [WORK_DIR, CACHE_DIR, RGB_CACHE_DIR]:
     os.makedirs(_d, exist_ok=True)
+
+
+def warp_cache_path() -> str:
+    return os.path.join(CACHE_DIR, WARP_CACHE_BASENAME)
 
 # Weak-cache sharding / shared store configuration
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -1050,13 +1065,102 @@ def _load_bool_mask_npz(path: str) -> np.ndarray:
         return np.unpackbits(packed, axis=1)[:, :W].astype(bool)
 
 # ===========================
+# Geometry helpers
+# ===========================
+def compute_center_px(h: int, w: int, left_mask_px: int, override: Optional[Tuple[float, float]] = None) -> Tuple[float, float]:
+    if override is not None:
+        return float(override[0]), float(override[1])
+    w_eff = max(1.0, float(w - left_mask_px))
+    cx = float(left_mask_px) + 0.5 * w_eff
+    cy = 0.5 * float(h)
+    return cx, cy
+
+
+def compute_mpp(h: int, w: int, left_mask_px: int, range_km: float) -> float:
+    w_eff = max(1.0, float(w - left_mask_px))
+    r_px = max(w_eff, float(h)) * 0.5
+    return (range_km * 1000.0) / max(r_px, 1e-6)
+
+
+def build_warp_grid(
+    shape_a: Tuple[int, int],
+    shape_b: Tuple[int, int],
+    left_mask_px: int,
+    radar_a_latlon: Tuple[float, float],
+    radar_b_latlon: Tuple[float, float],
+    range_a_km: float,
+    range_b_km: float,
+    center_override_a: Optional[Tuple[float, float]] = None,
+    center_override_b: Optional[Tuple[float, float]] = None,
+):
+    hA, wA = map(int, shape_a)
+    hB, wB = map(int, shape_b)
+    cxA, cyA = compute_center_px(hA, wA, left_mask_px, center_override_a)
+    cxB, cyB = compute_center_px(hB, wB, left_mask_px, center_override_b)
+    mppA = compute_mpp(hA, wA, left_mask_px, range_a_km)
+    mppB = compute_mpp(hB, wB, left_mask_px, range_b_km)
+
+    proj = Transformer.from_crs(
+        "EPSG:4326",
+        f"+proj=aeqd +lat_0={radar_a_latlon[0]} +lon_0={radar_a_latlon[1]} +datum=WGS84",
+        always_xy=True,
+    )
+    dx_b, dy_b = proj.transform(radar_b_latlon[1], radar_b_latlon[0])
+
+    yy, xx = np.mgrid[0:hA, 0:wA].astype(np.float32)
+    xA_m = (xx - cxA).astype(np.float32) * mppA
+    # Image rows increase southward, but AEQD's Y axis increases northward.
+    # Flip the sign when moving between pixel rows and metric northings so
+    # that the warp aligns properly in latitude.
+    yA_m = (cyA - yy).astype(np.float32) * mppA
+
+    inv_mppB = 1.0 / max(mppB, 1e-6)
+    xB_pix = (xA_m - dx_b) * inv_mppB + cxB
+    yB_pix = cyB - (yA_m - dy_b) * inv_mppB
+
+    norm_x = ((xB_pix + 0.5) / max(float(wB), 1.0)) * 2.0 - 1.0
+    norm_y = ((yB_pix + 0.5) / max(float(hB), 1.0)) * 2.0 - 1.0
+    grid = np.stack([norm_x, norm_y], axis=-1).astype(np.float32)
+
+    meta = {
+        "cxA": float(cxA),
+        "cyA": float(cyA),
+        "cxB": float(cxB),
+        "cyB": float(cyB),
+        "mpp_A": float(mppA),
+        "mpp_B": float(mppB),
+        "W_eff_A": float(wA - left_mask_px),
+        "W_eff_B": float(wB - left_mask_px),
+    }
+    return grid, meta
+
+
+# ===========================
+# CLI helpers
+# ===========================
+def _parse_center_tuple(value: str) -> Tuple[float, float]:
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("Center must be specified as 'cx,cy'.")
+    try:
+        return float(parts[0]), float(parts[1])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid center tuple '{value}'") from exc
+
+
+# ===========================
 # Helper channels
 # ===========================
-def helper_channels(h: int, w: int, center: Optional[Tuple[int,int]] = None):
+def helper_channels(h: int, w: int, center: Optional[Tuple[float, float]] = None):
     yy, xx = np.mgrid[0:h, 0:w]
-    cx, cy = (w//2, h//2) if center is None else center
-    dx = (xx - cx).astype(np.float32); dy = (yy - cy).astype(np.float32)
-    r = np.sqrt(dx*dx + dy*dy); r_norm = r / (r.max() + 1e-6)
+    if center is None:
+        cx, cy = (w // 2, h // 2)
+    else:
+        cx, cy = center
+    dx = (xx - cx).astype(np.float32)
+    dy = (yy - cy).astype(np.float32)
+    r = np.sqrt(dx * dx + dy * dy)
+    r_norm = r / (r.max() + 1e-6)
     ang = np.arctan2(dy, dx)
     return r_norm.astype(np.float32), np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
 
@@ -1130,6 +1234,15 @@ class DataConfig:
     pos_crop_tries: int = POS_CROP_TRIES
     fuse_mode: str = "max"
     weak_label_device: str = "cpu"
+    warp_cache_path: Optional[str] = None
+    radar_a_latlon: Tuple[float, float] = field(default_factory=lambda: RADAR_A_LATLON)
+    radar_b_latlon: Tuple[float, float] = field(default_factory=lambda: RADAR_B_LATLON)
+    radar_a_range_km: float = field(default_factory=lambda: RADAR_A_RANGE_KM)
+    radar_b_range_km: float = field(default_factory=lambda: RADAR_B_RANGE_KM)
+    center_override_a: Optional[Tuple[float, float]] = None
+    center_override_b: Optional[Tuple[float, float]] = None
+    do_inpaint: bool = False
+    inpaint_frac: float = 0.0
 
 class TwoRadarFusionDataset(Dataset):
     def __init__(self, sources: List[SourceData], split: str = "train", val_split: float = VAL_SPLIT, dcfg: Optional[DataConfig] = None):
@@ -1138,6 +1251,21 @@ class TwoRadarFusionDataset(Dataset):
         self.dcfg = dcfg or DataConfig()
         if self.dcfg.weak_label_device != "cpu" and not torch.cuda.is_available():
             self.dcfg.weak_label_device = "cpu"
+        self.left_mask_px = int(self.dcfg.left_mask_px)
+        self.warp_path = self.dcfg.warp_cache_path or warp_cache_path()
+        self.radar_a_latlon = self.dcfg.radar_a_latlon
+        self.radar_b_latlon = self.dcfg.radar_b_latlon
+        self.radar_a_range_km = float(self.dcfg.radar_a_range_km)
+        self.radar_b_range_km = float(self.dcfg.radar_b_range_km)
+        self.center_override_a = self.dcfg.center_override_a
+        self.center_override_b = self.dcfg.center_override_b
+        self.do_inpaint = bool(self.dcfg.do_inpaint)
+        self.inpaint_frac = max(0.0, float(self.dcfg.inpaint_frac))
+        self._warp_base: Optional[torch.Tensor] = None
+        self._warp_meta: Optional[Dict[str, float]] = None
+        self._warp_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._warp_shape: Optional[Tuple[int, int]] = None
+        self._warp_warned = False
         ts_all = sorted(set([it["ts"] for it in self.A.items] + [it["ts"] for it in self.B.items]))
         n = len(ts_all); n_val = max(1, int(n * val_split))
         self.ts_list = ts_all[:n - n_val] if split == "train" else ts_all[n - n_val:]
@@ -1189,6 +1317,115 @@ class TwoRadarFusionDataset(Dataset):
         if k:
             tensor = torch.rot90(tensor, k, dims=(-2, -1))
         return tensor
+
+    def _helper_center(self, H: int, W: int) -> Tuple[float, float]:
+        return compute_center_px(H, W, self.left_mask_px, self.center_override_a)
+
+    def _ensure_warp_base(self, shape_a: Tuple[int, int], shape_b: Tuple[int, int]):
+        if self._warp_base is not None:
+            return
+        path = self.warp_path
+        base_shape_a = tuple(map(int, shape_a))
+        base_shape_b = tuple(map(int, shape_b))
+        if path and os.path.isfile(path):
+            arr = np.load(path)
+            self._warp_base = torch.from_numpy(np.asarray(arr, dtype=np.float32))
+            self._warp_shape = (int(arr.shape[0]), int(arr.shape[1]))
+            if self._warp_shape != base_shape_a:
+                grid_np, meta = build_warp_grid(
+                    base_shape_a,
+                    base_shape_b,
+                    self.left_mask_px,
+                    self.radar_a_latlon,
+                    self.radar_b_latlon,
+                    self.radar_a_range_km,
+                    self.radar_b_range_km,
+                    center_override_a=self.center_override_a,
+                    center_override_b=self.center_override_b,
+                )
+                self._warp_base = torch.from_numpy(grid_np)
+                self._warp_shape = (grid_np.shape[0], grid_np.shape[1])
+                self._warp_meta = meta
+                try:
+                    ensure_dir(os.path.dirname(path))
+                    np.save(path, grid_np)
+                except Exception:
+                    pass
+                if not self._warp_warned:
+                    print("⚠️  warp grid resized to match current geometry", flush=True)
+                    self._warp_warned = True
+            else:
+                cxA, cyA = compute_center_px(base_shape_a[0], base_shape_a[1], self.left_mask_px, self.center_override_a)
+                cxB, cyB = compute_center_px(base_shape_b[0], base_shape_b[1], self.left_mask_px, self.center_override_b)
+                mppA = compute_mpp(base_shape_a[0], base_shape_a[1], self.left_mask_px, self.radar_a_range_km)
+                mppB = compute_mpp(base_shape_b[0], base_shape_b[1], self.left_mask_px, self.radar_b_range_km)
+                self._warp_meta = {
+                    "cxA": float(cxA),
+                    "cyA": float(cyA),
+                    "cxB": float(cxB),
+                    "cyB": float(cyB),
+                    "mpp_A": float(mppA),
+                    "mpp_B": float(mppB),
+                    "W_eff_A": float(base_shape_a[1] - self.left_mask_px),
+                    "W_eff_B": float(base_shape_b[1] - self.left_mask_px),
+                }
+        else:
+            grid_np, meta = build_warp_grid(
+                base_shape_a,
+                base_shape_b,
+                self.left_mask_px,
+                self.radar_a_latlon,
+                self.radar_b_latlon,
+                self.radar_a_range_km,
+                self.radar_b_range_km,
+                center_override_a=self.center_override_a,
+                center_override_b=self.center_override_b,
+            )
+            self._warp_base = torch.from_numpy(grid_np)
+            self._warp_shape = (grid_np.shape[0], grid_np.shape[1])
+            self._warp_meta = meta
+            if path:
+                try:
+                    ensure_dir(os.path.dirname(path))
+                    np.save(path, grid_np)
+                except Exception:
+                    pass
+            if not self._warp_warned:
+                print("⚠️  warp grid rebuilt on the fly", flush=True)
+                self._warp_warned = True
+
+    def _get_warp_grid(self, target_shape: Tuple[int, int]) -> torch.Tensor:
+        if self._warp_base is None:
+            raise RuntimeError("Warp grid not initialized; call _ensure_warp_base first.")
+        if tuple(target_shape) == self._warp_shape:
+            return self._warp_base.unsqueeze(0)
+        key = tuple(map(int, target_shape))
+        if key not in self._warp_cache:
+            base = self._warp_base.permute(2, 0, 1).unsqueeze(0)
+            resized = F.interpolate(base, size=target_shape, mode="bilinear", align_corners=False)
+            self._warp_cache[key] = resized.squeeze(0).permute(1, 2, 0).contiguous()
+        return self._warp_cache[key].unsqueeze(0)
+
+    def _warp_triplet(self, inten_list, av_list, mask_list, target_shape: Tuple[int, int]):
+        grid = self._get_warp_grid(target_shape)
+        def _warp_stack(stack, mode):
+            if not stack:
+                return []
+            stacked = torch.stack(stack, dim=0).unsqueeze(1).to(torch.float32)
+            g = grid.to(stacked.device)
+            if g.shape[0] != stacked.shape[0]:
+                g = g.expand(stacked.shape[0], -1, -1, -1)
+            warped = F.grid_sample(stacked, g, mode=mode, padding_mode="zeros", align_corners=False)
+            return [t.contiguous() for t in warped.squeeze(1)]
+
+        inten_out = _warp_stack(inten_list, mode="bilinear")
+        av_out = _warp_stack(av_list, mode="bilinear")
+        mask_out = None
+        if mask_list is not None:
+            mask_float = [m.to(torch.float32) for m in mask_list]
+            mask_warp = _warp_stack(mask_float, mode="bilinear")
+            mask_out = [m > 0.5 for m in mask_warp]
+        return inten_out, av_out, mask_out
 
     def _pad_to(self, tensor: torch.Tensor, th: int, tw: int, mode: str = "reflect", value: float = 0.0):
         ph = max(0, th - tensor.shape[-2])
@@ -1301,12 +1538,23 @@ class TwoRadarFusionDataset(Dataset):
             frames_hw.append((mask_t, inten_t))
             avs_hw.append(torch.full((H, W), float(pflag), dtype=torch.float32))
 
+        a_base_shape = None
+        b_base_shape = None
+        for i, pair in enumerate(pairs):
+            if pair is None:
+                continue
+            if i < 3 and a_base_shape is None:
+                a_base_shape = pair[0].shape
+            if i >= 3 and b_base_shape is None:
+                b_base_shape = pair[0].shape
+
         atlas_A = torch.from_numpy(_fit_mask_to(H, W, self.A.atlas)).to(torch.bool)
         atlas_B = torch.from_numpy(_fit_mask_to(H, W, self.B.atlas)).to(torch.bool)
 
         def proc_triplet(triplet, av_triplet, atlas):
             out_inten = []
             out_av = []
+            out_mask = []
             mask_t = None
             inten_t = None
             clear_mask = (~atlas)
@@ -1318,17 +1566,27 @@ class TwoRadarFusionDataset(Dataset):
                 av = av.to(torch.float32) * clear_float
                 out_inten.append(inten)
                 out_av.append(av)
+                out_mask.append(mask)
                 if i == 1:
                     mask_t, inten_t = mask, inten
-            return out_inten, out_av, mask_t, inten_t
+            return out_inten, out_av, out_mask, mask_t, inten_t
 
         A_prev, A_t, A_next = frames_hw[0:3]
         B_prev, B_t, B_next = frames_hw[3:6]
         A_prev_av, A_t_av, A_next_av = avs_hw[0:3]
         B_prev_av, B_t_av, B_next_av = avs_hw[3:6]
 
-        intenA, avA, maskA_t, intenA_t = proc_triplet([A_prev, A_t, A_next], [A_prev_av, A_t_av, A_next_av], atlas_A)
-        intenB, avB, maskB_t, intenB_t = proc_triplet([B_prev, B_t, B_next], [B_prev_av, B_t_av, B_next_av], atlas_B)
+        intenA, avA, maskA_list, maskA_t, intenA_t = proc_triplet([A_prev, A_t, A_next], [A_prev_av, A_t_av, A_next_av], atlas_A)
+        intenB, avB, maskB_list, maskB_t, intenB_t = proc_triplet([B_prev, B_t, B_next], [B_prev_av, B_t_av, B_next_av], atlas_B)
+        base_shape_a = tuple(int(x) for x in (a_base_shape if a_base_shape is not None else (H, W)))
+        base_shape_b = tuple(int(x) for x in (b_base_shape if b_base_shape is not None else (H, W)))
+        self._ensure_warp_base(base_shape_a, base_shape_b)
+        intenB, avB, maskB_list = self._warp_triplet(intenB, avB, maskB_list, (H, W))
+        if maskB_list:
+            maskB_t = maskB_list[1]
+        if intenB:
+            intenB_t = intenB[1]
+
         if self.dcfg.fuse_mode == "mean":
             avail_sum = A_t_av + B_t_av
             denom = torch.where(avail_sum > 0, avail_sum, torch.ones_like(avail_sum))
@@ -1339,8 +1597,29 @@ class TwoRadarFusionDataset(Dataset):
 
         key = (H, W)
         if key not in self._hc_cache:
-            self._hc_cache[key] = tuple(torch.from_numpy(arr).to(torch.float32) for arr in helper_channels(H, W, center=None))
+            center = self._helper_center(H, W)
+            self._hc_cache[key] = tuple(torch.from_numpy(arr).to(torch.float32) for arr in helper_channels(H, W, center=center))
         r_norm, cos_t, sin_t = (t.clone() for t in self._hc_cache[key])
+
+        inpaint_mask = torch.zeros((H, W), dtype=torch.bool)
+        if self.do_inpaint and self.inpaint_frac > 0.0:
+            allowed = (~atlas_A).clone()
+            if allowed.shape[1] > self.left_mask_px:
+                allowed[:, :self.left_mask_px] = False
+            else:
+                allowed.zero_()
+            avail_combined = (avA[1] > 0.0) | (avB[1] > 0.0)
+            allowed = allowed.logical_and(avail_combined > 0.0)
+            if allowed.any():
+                noise = torch.rand(allowed.shape, dtype=torch.float32)
+                holes = noise < self.inpaint_frac
+                holes = holes.logical_and(allowed)
+                if holes.any():
+                    intenA[1] = intenA[1].masked_fill(holes, 0.0)
+                    intenB[1] = intenB[1].masked_fill(holes, 0.0)
+                    avA[1] = avA[1].masked_fill(holes, 0.0)
+                    avB[1] = avB[1].masked_fill(holes, 0.0)
+                inpaint_mask = holes
 
         chs = [
             intenA[0], intenA[1], intenA[2],
@@ -1354,29 +1633,39 @@ class TwoRadarFusionDataset(Dataset):
         chs = [self._apply_view(ch, view) for ch in chs]
         y_mask = self._apply_view(y_mask, view)
         y_dbz = self._apply_view(y_dbz, view)
+        inpaint_mask = self._apply_view(inpaint_mask, view)
 
         target_h = max(crop_sz, max(int(ch.shape[0]) for ch in chs))
         target_w = max(crop_sz, max(int(ch.shape[1]) for ch in chs))
         chs = [self._pad_to(ch, target_h, target_w, mode="reflect") for ch in chs]
         y_mask = self._pad_to(y_mask, target_h, target_w, mode="reflect")
         y_dbz = self._pad_to(y_dbz, target_h, target_w, mode="reflect")
+        inpaint_mask = self._pad_to(inpaint_mask, target_h, target_w, mode="constant", value=0.0)
 
         crop = crop_sz
         y0, x0 = self._choose_crop(chs, y_mask, crop)
         chs = [ch[y0:y0+crop, x0:x0+crop] for ch in chs]
         y_mask = y_mask[y0:y0+crop, x0:x0+crop]
         y_dbz = y_dbz[y0:y0+crop, x0:x0+crop]
+        inpaint_mask = inpaint_mask[y0:y0+crop, x0:x0+crop]
 
         x = torch.stack(chs, dim=0).to(torch.float32)
         y_mask = y_mask.to(torch.float32).unsqueeze(0)
         y_dbz = y_dbz.to(torch.float32).unsqueeze(0)
+        inpaint_mask = inpaint_mask.to(torch.float32).unsqueeze(0)
 
         if torch.cuda.is_available():
             x = x.pin_memory()
             y_mask = y_mask.pin_memory()
             y_dbz = y_dbz.pin_memory()
+            inpaint_mask = inpaint_mask.pin_memory()
 
-        return {"x": x.contiguous(), "y_mask": y_mask.contiguous(), "y_dbz": y_dbz.contiguous()}
+        return {
+            "x": x.contiguous(),
+            "y_mask": y_mask.contiguous(),
+            "y_dbz": y_dbz.contiguous(),
+            "inpaint_mask": inpaint_mask.contiguous(),
+        }
 
 # ===========================
 # Model: Tiny U-Net with GroupNorm
@@ -1592,15 +1881,36 @@ def build_sources(rank=0):
     if len(sources) != 2:
         if rank == 0: print("Need exactly two valid radar sources in RADAR_DIRS.", flush=True)
         raise SystemExit(1)
+    ordered = []
+    for rid in (RADAR_A_ID.lower(), RADAR_B_ID.lower()):
+        match = next((s for s in sources if rid in os.path.basename(s.root).lower()), None)
+        if match is not None and match not in ordered:
+            ordered.append(match)
+    if len(ordered) == 2:
+        sources = ordered
+    elif rank == 0:
+        print("⚠️  Could not infer radar ordering from folder names; using provided order.", flush=True)
     return sources
 
-def make_loaders(sources, device, rank, world_size, num_workers, prefetch_factor):
+def make_loaders(sources, device, rank, world_size, num_workers, prefetch_factor,
+                 warp_path: Optional[str] = None, do_inpaint: bool = False, inpaint_frac: float = 0.0):
     weak_dev = WEAK_LABEL_DEVICE
     if weak_dev != "cpu" and not torch.cuda.is_available():
         weak_dev = "cpu"
-    dcfg = DataConfig(weak_label_device=weak_dev)
-    train_ds = TwoRadarFusionDataset(sources, split="train", val_split=VAL_SPLIT, dcfg=dcfg)
-    val_ds   = TwoRadarFusionDataset(sources, split="val",   val_split=VAL_SPLIT, dcfg=dcfg)
+    common_cfg = dict(
+        weak_label_device=weak_dev,
+        warp_cache_path=warp_path,
+        radar_a_latlon=RADAR_A_LATLON,
+        radar_b_latlon=RADAR_B_LATLON,
+        radar_a_range_km=RADAR_A_RANGE_KM,
+        radar_b_range_km=RADAR_B_RANGE_KM,
+        center_override_a=RADAR_A_CENTER_OVERRIDE,
+        center_override_b=RADAR_B_CENTER_OVERRIDE,
+    )
+    train_cfg = DataConfig(do_inpaint=do_inpaint, inpaint_frac=inpaint_frac, **common_cfg)
+    val_cfg = DataConfig(do_inpaint=False, inpaint_frac=0.0, **common_cfg)
+    train_ds = TwoRadarFusionDataset(sources, split="train", val_split=VAL_SPLIT, dcfg=train_cfg)
+    val_ds   = TwoRadarFusionDataset(sources, split="val",   val_split=VAL_SPLIT, dcfg=val_cfg)
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False) if ddp_is_dist() else None
     val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=rank, shuffle=False, drop_last=False) if ddp_is_dist() else None
@@ -1631,7 +1941,7 @@ def make_loaders(sources, device, rank, world_size, num_workers, prefetch_factor
         eff_bsz = BATCH_SIZE * (world_size if ddp_is_dist() else 1) * max(1, GRAD_ACCUM_STEPS)
         print(f"Effective batch size (per optimizer step): {eff_bsz}", flush=True)
 
-    return dcfg, train_ds, val_ds, train_loader, val_loader, train_sampler, val_sampler
+    return train_cfg, train_ds, val_ds, train_loader, val_loader, train_sampler, val_sampler
 
 # ===========================
 # SWA helpers
@@ -1702,6 +2012,7 @@ def run_training(hparams, device, rank, local_rank, world_size,
     dice_w = hparams.get("dice_weight", DICE_WEIGHT)
     use_swa = hparams.get("use_swa", (USE_SWA and scheduler_kind == "cosine"))
     grad_accum = max(1, hparams.get("grad_accum_steps", GRAD_ACCUM_STEPS))
+    inpaint_weight = max(0.0, hparams.get("inpaint_weight", 0.0))
 
     AMP_DEVICE = "cuda" if (device.type == "cuda") else "cpu"
     AMP_ENABLED = bool(MIXED_PRECISION and (AMP_DEVICE == "cuda"))
@@ -1800,6 +2111,7 @@ def run_training(hparams, device, rank, local_rank, world_size,
 
         model.train()
         running = 0.0
+        running_inpaint = 0.0
         bar = _make_bar(train_loader, f"Train e{epoch}", rank)
         opt.zero_grad(set_to_none=True)
 
@@ -1829,7 +2141,11 @@ def run_training(hparams, device, rank, local_rank, world_size,
             y_mask_raw = batch["y_mask"].to(device, non_blocking=(device.type=="cuda"))
             y_mask = y_mask_raw if LABEL_SMOOTH_EPS <= 0 else y_mask_raw*(1.0 - LABEL_SMOOTH_EPS) + 0.5*LABEL_SMOOTH_EPS
             y_dbz = batch["y_dbz"].to(device, non_blocking=(device.type=="cuda"))
+            inpaint_mask = batch.get("inpaint_mask")
+            if inpaint_mask is not None:
+                inpaint_mask = inpaint_mask.to(device, non_blocking=(device.type=="cuda"))
 
+            loss_inpaint = torch.zeros((), device=device)
             with (torch.amp.autocast("cuda", dtype=(torch.bfloat16 if (device.type=="cuda" and torch.cuda.is_bf16_supported()) else torch.float16), enabled=(device.type=="cuda" and MIXED_PRECISION)) if device.type=="cuda" else contextlib.nullcontext()):
                 logits, dbz_pred = model(x)
                 loss_mask = loss_focal(logits, y_mask) + dice_w * dice_loss(logits, y_mask)
@@ -1837,7 +2153,18 @@ def run_training(hparams, device, rank, local_rank, world_size,
                 l1 = F.smooth_l1_loss(dbz_pred, y_dbz, reduction="none")
                 pos = gate.sum()
                 loss_dbz = (l1 * gate).sum() / (pos + 1e-6)
-                loss = (loss_mask + lambda_dbz * loss_dbz) / grad_accum
+                if inpaint_mask is not None and inpaint_weight > 0.0:
+                    holes = inpaint_mask.to(torch.float32)
+                    hole_count = holes.sum()
+                    if hole_count > 0:
+                        l1_all = F.l1_loss(dbz_pred, y_dbz, reduction="none")
+                        loss_inpaint = (l1_all * holes).sum() / hole_count
+                    else:
+                        loss_inpaint = torch.zeros((), device=device)
+                total_loss = loss_mask + lambda_dbz * loss_dbz
+                if inpaint_mask is not None and inpaint_weight > 0.0:
+                    total_loss = total_loss + inpaint_weight * loss_inpaint
+                loss = total_loss / grad_accum
 
             if device.type == "cuda":
                 scaler.scale(loss).backward()
@@ -1849,7 +2176,11 @@ def run_training(hparams, device, rank, local_rank, world_size,
             if step % grad_accum == 0:
                 optimizer_step()
 
-            running = (0.98 * running + 0.02 * float((loss * grad_accum).item())) if step > 1 else float((loss * grad_accum).item())
+            loss_display = float((loss * grad_accum).item())
+            running = (0.98 * running + 0.02 * loss_display) if step > 1 else loss_display
+            if inpaint_weight > 0.0 and inpaint_mask is not None:
+                linp_val = float(loss_inpaint.detach().item())
+                running_inpaint = (0.98 * running_inpaint + 0.02 * linp_val) if step > 1 else linp_val
 
             if is_main(rank):
                 mem_alloc, mem_res, mem_peak = _cuda_mem()
@@ -1857,7 +2188,10 @@ def run_training(hparams, device, rank, local_rank, world_size,
                 global_bsz = x.size(0) * (world_size if ddp_is_dist() else 1)
                 dt = max(1e-6, time.time() - iter_t0)
                 ips = global_bsz / dt
-                bar.set_postfix(loss=f"{running:.4f}", lr=f"{cur_lr:.2e}", ips=f"{ips:.1f}/s", mem=f"{mem_alloc:.2f}G|{mem_peak:.2f}G")
+                postfix = dict(loss=f"{running:.4f}", lr=f"{cur_lr:.2e}", ips=f"{ips:.1f}/s", mem=f"{mem_alloc:.2f}G|{mem_peak:.2f}G")
+                if inpaint_weight > 0.0 and inpaint_mask is not None:
+                    postfix["linp"] = f"{running_inpaint:.4f}"
+                bar.set_postfix(**postfix)
 
         if (steps_processed % grad_accum) != 0:
             optimizer_step()
@@ -1886,6 +2220,9 @@ def run_training(hparams, device, rank, local_rank, world_size,
                     y_mask_raw = batch["y_mask"].to(device, non_blocking=(device.type=="cuda"))
                     y_mask = y_mask_raw if LABEL_SMOOTH_EPS <= 0 else y_mask_raw*(1.0 - LABEL_SMOOTH_EPS) + 0.5*LABEL_SMOOTH_EPS
                     y_dbz = batch["y_dbz"].to(device, non_blocking=(device.type=="cuda"))
+                    inpaint_mask = batch.get("inpaint_mask")
+                    if inpaint_mask is not None:
+                        inpaint_mask = inpaint_mask.to(device, non_blocking=(device.type=="cuda"))
                     if device.type == "cuda":
                         with torch.amp.autocast("cuda", dtype=(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16), enabled=MIXED_PRECISION):
                             logits, dbz_pred = _predict_tta(m, x, do_tta=do_tta)
@@ -1895,7 +2232,17 @@ def run_training(hparams, device, rank, local_rank, world_size,
                     gate = (y_mask_raw > 0.5).float()
                     l1 = F.smooth_l1_loss(dbz_pred, y_dbz, reduction="none")
                     pos = gate.sum()
-                    step_loss = float((loss_mask + lambda_dbz * (l1 * gate).sum() / (pos + 1e-6)).item())
+                    loss_inpaint_val = torch.zeros((), device=device)
+                    if inpaint_mask is not None and inpaint_weight > 0.0:
+                        holes = inpaint_mask.to(torch.float32)
+                        hole_count = holes.sum()
+                        if hole_count > 0:
+                            l1_all = F.l1_loss(dbz_pred, y_dbz, reduction="none")
+                            loss_inpaint_val = (l1_all * holes).sum() / hole_count
+                    total = loss_mask + lambda_dbz * (l1 * gate).sum() / (pos + 1e-6)
+                    if inpaint_mask is not None and inpaint_weight > 0.0:
+                        total = total + inpaint_weight * loss_inpaint_val
+                    step_loss = float(total.item())
                     bs = x.size(0)
                     loss_sum += step_loss * bs
                     count_sum += bs
@@ -2083,8 +2430,10 @@ def stage_cpu_prep(args):
     # ---- index & summary ----
     sources = build_sources(rank=0)
     print("Summary per source:", flush=True)
+    shapes = []
     for src in sources:
         h, w = imread_rgb(src.items[0]["path"]).shape[:2]
+        shapes.append((h, w))
         print(f"  {os.path.basename(src.root)}: frames={len(src.items)} size={w}x{h}", flush=True)
         # verify atlas file is readable on disk
         npz_path, _ = _atlas_cache_paths(src.root)
@@ -2099,8 +2448,33 @@ def stage_cpu_prep(args):
             _ = _load_bool_mask_npz(npz_path)
             print(f"  ✅ atlas rebuilt OK at {npz_path}", flush=True)
 
+    if getattr(args, "precompute_warp", False):
+        if len(shapes) != 2:
+            raise RuntimeError("Need two radar sources to precompute warp.")
+        warp_out = args.warp_cache_path or warp_cache_path()
+        ensure_dir(os.path.dirname(warp_out))
+        grid_np, meta = build_warp_grid(
+            shapes[0],
+            shapes[1],
+            LEFT_MASK_PX,
+            RADAR_A_LATLON,
+            RADAR_B_LATLON,
+            RADAR_A_RANGE_KM,
+            RADAR_B_RANGE_KM,
+            center_override_a=RADAR_A_CENTER_OVERRIDE,
+            center_override_b=RADAR_B_CENTER_OVERRIDE,
+        )
+        np.save(warp_out, grid_np)
+        print(
+            f"Warp B→A saved to {warp_out}\n"
+            f"  H={shapes[0][0]} W={shapes[0][1]} LEFT_MASK_PX={LEFT_MASK_PX} "
+            f"W_eff={meta['W_eff_A']:.1f} cx={meta['cxA']:.2f} cy={meta['cyA']:.2f} "
+            f"mpp_A={meta['mpp_A']:.4f} mpp_B={meta['mpp_B']:.4f}",
+            flush=True,
+        )
 
-     # ---- precompute ----
+
+    # ---- precompute ----
     hsvp = HSVParams()
     # quick status before any work
     have0, miss0, missing0 = weak_cache_status(sources, hsvp, LEFT_MASK_PX)
@@ -2180,8 +2554,17 @@ def stage_gpu_train(args):
     # Make loaders with user knobs
     n_workers = args.num_workers if args.num_workers is not None else NUM_WORKERS
     prefetch = args.prefetch_factor if args.prefetch_factor is not None else PREFETCH_FACTOR
+    warp_path = args.warp_cache_path or warp_cache_path()
     dcfg, train_ds, val_ds, train_loader, val_loader, train_sampler, val_sampler = make_loaders(
-        sources, device, rank, world_size, n_workers, prefetch
+        sources,
+        device,
+        rank,
+        world_size,
+        n_workers,
+        prefetch,
+        warp_path=warp_path,
+        do_inpaint=bool(args.do_inpaint),
+        inpaint_frac=max(0.0, float(args.inpaint_frac)),
     )
 
     final_val = run_training({
@@ -2200,6 +2583,7 @@ def stage_gpu_train(args):
         "dice_weight": DICE_WEIGHT,
         "use_swa": (USE_SWA and SCHEDULER == "cosine"),
         "grad_accum_steps": GRAD_ACCUM_STEPS,
+        "inpaint_weight": max(0.0, float(args.inpaint_weight)) if args.do_inpaint else 0.0,
     }, device, rank, local_rank, world_size,
        dcfg, train_ds, val_ds, train_loader, val_loader, train_sampler, val_sampler,
        save_ckpt_path=CKPT_PATH, verbose=True)
@@ -2226,6 +2610,16 @@ def parse_args():
     p.add_argument("--prep-workers", type=int, default=None, help="CPU-prep parallel workers (default: cpu_count-1)")
     p.add_argument("--omp-per-worker", type=int, default=1, help="OpenMP/MKL threads per worker")
     p.add_argument("--fast-io", action="store_true", help="Use faster, larger caches (RGB npy, no weak compress/bitpack)")
+    p.add_argument("--precompute-warp", action="store_true", help="Precompute and cache the Radar B→A warp grid")
+    p.add_argument("--warp-cache-path", type=str, default=None, help="Override path for the cached warp grid (.npy)")
+    p.add_argument("--radar-a-lat", type=float, default=RADAR_A_LATLON[0], help="Radar A latitude (degrees)")
+    p.add_argument("--radar-a-lon", type=float, default=RADAR_A_LATLON[1], help="Radar A longitude (degrees)")
+    p.add_argument("--radar-b-lat", type=float, default=RADAR_B_LATLON[0], help="Radar B latitude (degrees)")
+    p.add_argument("--radar-b-lon", type=float, default=RADAR_B_LATLON[1], help="Radar B longitude (degrees)")
+    p.add_argument("--radar-a-range-km", type=float, default=RADAR_A_RANGE_KM, help="Radar A range to far edge (km)")
+    p.add_argument("--radar-b-range-km", type=float, default=RADAR_B_RANGE_KM, help="Radar B range to far edge (km)")
+    p.add_argument("--radar-a-center", type=_parse_center_tuple, default=None, help="Override radar A center pixel as 'cx,cy'")
+    p.add_argument("--radar-b-center", type=_parse_center_tuple, default=None, help="Override radar B center pixel as 'cx,cy'")
     # Shared paths
     p.add_argument("--radar-dirs", type=str, default=None, help="Comma-separated radar folders, e.g. /data/njk,/data/nkm")
     p.add_argument("--work-dir", type=str, default=os.environ.get("WORK_DIR", WORK_DIR), help="Where to save checkpoints/logs")
@@ -2249,6 +2643,10 @@ def parse_args():
                    help="During cpu-prep, only build weak/RGB caches that are missing.")
     p.add_argument("--stop-on-error", action="store_true",
                    help="Abort cpu-prep if any file fails to cache.")
+    # Training regularization
+    p.add_argument("--do-inpaint", action="store_true", help="Enable inpaint objective during training")
+    p.add_argument("--inpaint-frac", type=float, default=0.0, help="Fraction of meteorology pixels masked for inpaint training")
+    p.add_argument("--inpaint-weight", type=float, default=0.5, help="Weight applied to masked L1 inpaint loss")
 
 
     return p.parse_args()
@@ -2264,6 +2662,12 @@ if __name__ == "__main__":
     CACHE_ROOT = args.cache_root
     CACHE_DIR = os.path.join(CACHE_ROOT, "cache")
     RGB_CACHE_DIR = os.path.join(CACHE_ROOT, "img_npy_cache")
+    RADAR_A_LATLON = (args.radar_a_lat, args.radar_a_lon)
+    RADAR_B_LATLON = (args.radar_b_lat, args.radar_b_lon)
+    RADAR_A_RANGE_KM = float(args.radar_a_range_km)
+    RADAR_B_RANGE_KM = float(args.radar_b_range_km)
+    RADAR_A_CENTER_OVERRIDE = args.radar_a_center
+    RADAR_B_CENTER_OVERRIDE = args.radar_b_center
     for _d in [WORK_DIR, CACHE_DIR, RGB_CACHE_DIR]:
         os.makedirs(_d, exist_ok=True)
 
