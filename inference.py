@@ -18,6 +18,7 @@ import numpy as np
 from PIL import Image
 
 import torch
+import torch.nn.functional as F
 
 import ddp as training_cfg
 
@@ -31,8 +32,13 @@ from ddp import (
     _load_bool_mask_npz,
     _weak_label_core,
     add_minutes,
+    build_warp_grid,
+    compute_center_px,
+    compute_mpp,
     helper_channels,
     list_images,
+    warp_cache_path,
+    _parse_center_tuple,
     parse_timestamp,
     ts_to_dt,
 )
@@ -241,13 +247,18 @@ def _discover_atlases(
     return matches[0], matches[1]
 
 
-def _infer_image_shape(paths: Sequence[Optional[str]]) -> Tuple[int, int]:
+def _infer_image_shape(
+    paths: Sequence[Optional[str]],
+    fallback: Optional[Tuple[int, int]] = None,
+) -> Tuple[int, int]:
     for path in paths:
         if path is None:
             continue
         with Image.open(path) as img:
             h, w = img.size[1], img.size[0]
             return h, w
+    if fallback is not None:
+        return fallback
     raise RuntimeError("Unable to determine image dimensions from provided paths.")
 
 
@@ -301,6 +312,111 @@ def _process_radar_source(
         availability_channels.append(availability)
 
     return intensity_channels, availability_channels
+
+
+def _compute_warp_meta(
+    shape_a: Tuple[int, int],
+    shape_b: Tuple[int, int],
+    left_mask_px: int,
+    radar_a_range_km: float,
+    radar_b_range_km: float,
+    center_override_a: Optional[Tuple[float, float]] = None,
+    center_override_b: Optional[Tuple[float, float]] = None,
+) -> Dict[str, float]:
+    h_a, w_a = map(int, shape_a)
+    h_b, w_b = map(int, shape_b)
+    cx_a, cy_a = compute_center_px(h_a, w_a, left_mask_px, center_override_a)
+    cx_b, cy_b = compute_center_px(h_b, w_b, left_mask_px, center_override_b)
+    mpp_a = compute_mpp(h_a, w_a, left_mask_px, radar_a_range_km)
+    mpp_b = compute_mpp(h_b, w_b, left_mask_px, radar_b_range_km)
+    return {
+        "cxA": float(cx_a),
+        "cyA": float(cy_a),
+        "cxB": float(cx_b),
+        "cyB": float(cy_b),
+        "mpp_A": float(mpp_a),
+        "mpp_B": float(mpp_b),
+        "W_eff_A": float(w_a - left_mask_px),
+        "W_eff_B": float(w_b - left_mask_px),
+    }
+
+
+def _load_or_build_warp_grid(
+    shape_a: Tuple[int, int],
+    shape_b: Tuple[int, int],
+    left_mask_px: int,
+    warp_path: Optional[str],
+    radar_a_latlon: Tuple[float, float],
+    radar_b_latlon: Tuple[float, float],
+    radar_a_range_km: float,
+    radar_b_range_km: float,
+    center_override_a: Optional[Tuple[float, float]] = None,
+    center_override_b: Optional[Tuple[float, float]] = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    shape_a = tuple(map(int, shape_a))
+    shape_b = tuple(map(int, shape_b))
+    meta = _compute_warp_meta(
+        shape_a,
+        shape_b,
+        left_mask_px,
+        radar_a_range_km,
+        radar_b_range_km,
+        center_override_a=center_override_a,
+        center_override_b=center_override_b,
+    )
+
+    grid_np: Optional[np.ndarray] = None
+    path_obj: Optional[Path] = None
+    if warp_path:
+        path_obj = Path(warp_path)
+        if path_obj.is_file():
+            arr = np.load(path_obj)
+            grid_np = np.asarray(arr, dtype=np.float32)
+            if grid_np.ndim != 3 or grid_np.shape[2] != 2:
+                grid_np = None
+            elif grid_np.shape[0] != shape_a[0] or grid_np.shape[1] != shape_a[1]:
+                grid_np, _ = build_warp_grid(
+                    shape_a,
+                    shape_b,
+                    left_mask_px,
+                    radar_a_latlon,
+                    radar_b_latlon,
+                    radar_a_range_km,
+                    radar_b_range_km,
+                    center_override_a=center_override_a,
+                    center_override_b=center_override_b,
+                )
+                try:
+                    path_obj.parent.mkdir(parents=True, exist_ok=True)
+                    np.save(path_obj, grid_np)
+                except Exception:
+                    pass
+            else:
+                grid_np = grid_np.astype(np.float32, copy=False)
+
+    if grid_np is None:
+        grid_np, _ = build_warp_grid(
+            shape_a,
+            shape_b,
+            left_mask_px,
+            radar_a_latlon,
+            radar_b_latlon,
+            radar_a_range_km,
+            radar_b_range_km,
+            center_override_a=center_override_a,
+            center_override_b=center_override_b,
+        )
+        if path_obj is None and warp_path:
+            path_obj = Path(warp_path)
+        if path_obj is not None:
+            try:
+                path_obj.parent.mkdir(parents=True, exist_ok=True)
+                np.save(path_obj, grid_np)
+            except Exception:
+                pass
+
+    grid_torch = torch.from_numpy(np.asarray(grid_np, dtype=np.float32))
+    return grid_torch, meta
 
 
 def _intensity_to_radar_rgb(cleaned_intensity: np.ndarray) -> np.ndarray:
@@ -441,15 +557,55 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
 
     args.anchor_timestamp = anchor_ts
 
-    # Determine shared image shape
-    image_shape = _infer_image_shape(paths_a + paths_b)
+    # Determine native shapes per radar
+    try:
+        shape_a = _infer_image_shape(paths_a)
+    except RuntimeError:
+        shape_a = _infer_image_shape(paths_b)
+    shape_b = _infer_image_shape(paths_b, fallback=shape_a)
 
     # Load atlases if provided
-    atlas_a = _load_atlas(args.atlas_a, image_shape)
-    atlas_b = _load_atlas(args.atlas_b, image_shape)
+    atlas_a = _load_atlas(args.atlas_a, shape_a)
+    atlas_b = _load_atlas(args.atlas_b, shape_b)
 
-    inten_a, avail_a = _process_radar_source(paths_a, atlas_a, image_shape, hsvp, left_mask_px, device)
-    inten_b, avail_b = _process_radar_source(paths_b, atlas_b, image_shape, hsvp, left_mask_px, device)
+    inten_a, avail_a = _process_radar_source(paths_a, atlas_a, shape_a, hsvp, left_mask_px, device)
+    inten_b, avail_b = _process_radar_source(paths_b, atlas_b, shape_b, hsvp, left_mask_px, device)
+
+    radar_a_latlon = (float(args.radar_a_lat), float(args.radar_a_lon))
+    radar_b_latlon = (float(args.radar_b_lat), float(args.radar_b_lon))
+    radar_a_range_km = float(args.radar_a_range_km)
+    radar_b_range_km = float(args.radar_b_range_km)
+    center_override_a = args.radar_a_center or training_cfg.RADAR_A_CENTER_OVERRIDE
+    center_override_b = args.radar_b_center or training_cfg.RADAR_B_CENTER_OVERRIDE
+
+    warp_path = args.warp_cache_path or warp_cache_path()
+    warp_grid, warp_meta = _load_or_build_warp_grid(
+        shape_a,
+        shape_b,
+        left_mask_px,
+        warp_path,
+        radar_a_latlon,
+        radar_b_latlon,
+        radar_a_range_km,
+        radar_b_range_km,
+        center_override_a=center_override_a,
+        center_override_b=center_override_b,
+    )
+    warp_grid = warp_grid.to(device=device, dtype=torch.float32)
+
+    def _warp_channels(channels: List[torch.Tensor], mode: str) -> List[torch.Tensor]:
+        if not channels:
+            return channels
+        stack = torch.stack(channels, dim=0).unsqueeze(1)
+        grid = warp_grid.unsqueeze(0)
+        if grid.shape[0] != stack.shape[0]:
+            grid = grid.expand(stack.shape[0], -1, -1, -1)
+        warped = F.grid_sample(stack, grid, mode=mode, padding_mode="zeros", align_corners=False)
+        return [warped[i, 0].contiguous() for i in range(warped.shape[0])]
+
+    inten_b = _warp_channels(inten_b, mode="bilinear")
+    avail_b = _warp_channels(avail_b, mode="bilinear")
+    args.warp_meta = warp_meta
 
     all_channels: List[torch.Tensor] = []
     all_channels.extend(inten_a)
@@ -457,7 +613,8 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
     all_channels.extend(avail_a)
     all_channels.extend(avail_b)
 
-    r_norm, cos_t, sin_t = helper_channels(*image_shape)
+    helper_center = compute_center_px(shape_a[0], shape_a[1], left_mask_px, center_override_a)
+    r_norm, cos_t, sin_t = helper_channels(*shape_a, center=helper_center)
     all_channels.append(torch.from_numpy(r_norm).to(device=device, dtype=torch.float32))
     all_channels.append(torch.from_numpy(cos_t).to(device=device, dtype=torch.float32))
     all_channels.append(torch.from_numpy(sin_t).to(device=device, dtype=torch.float32))
@@ -507,6 +664,38 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--atlas-dir",
         default=str(DEFAULT_ATLAS_DIR),
         help="Directory to search for atlas files when --atlas-a/--atlas-b are not provided.",
+    )
+    parser.add_argument(
+        "--warp-cache-path",
+        help="Path to a cached Radar B→A warp grid (.npy). Defaults to the training cache location if omitted.",
+    )
+    parser.add_argument("--radar-a-lat", type=float, default=training_cfg.RADAR_A_LATLON[0], help="Radar A latitude (degrees).")
+    parser.add_argument("--radar-a-lon", type=float, default=training_cfg.RADAR_A_LATLON[1], help="Radar A longitude (degrees).")
+    parser.add_argument("--radar-b-lat", type=float, default=training_cfg.RADAR_B_LATLON[0], help="Radar B latitude (degrees).")
+    parser.add_argument("--radar-b-lon", type=float, default=training_cfg.RADAR_B_LATLON[1], help="Radar B longitude (degrees).")
+    parser.add_argument(
+        "--radar-a-range-km",
+        type=float,
+        default=training_cfg.RADAR_A_RANGE_KM,
+        help="Radar A range to the far edge (km).",
+    )
+    parser.add_argument(
+        "--radar-b-range-km",
+        type=float,
+        default=training_cfg.RADAR_B_RANGE_KM,
+        help="Radar B range to the far edge (km).",
+    )
+    parser.add_argument(
+        "--radar-a-center",
+        type=_parse_center_tuple,
+        default=training_cfg.RADAR_A_CENTER_OVERRIDE,
+        help="Override Radar A center pixel as 'cx,cy' (default: training configuration).",
+    )
+    parser.add_argument(
+        "--radar-b-center",
+        type=_parse_center_tuple,
+        default=training_cfg.RADAR_B_CENTER_OVERRIDE,
+        help="Override Radar B center pixel as 'cx,cy' (default: training configuration).",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
