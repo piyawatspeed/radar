@@ -20,7 +20,7 @@
 #   train (strict):  python ddp.py --stage gpu-train --strict-cache-only --strict-atlas-only --radar-dirs /path/njk,/path/nkm --cache-root /big/cache
 
 from __future__ import annotations
-import os, re, glob, math, time, random, gc, contextlib, bisect, argparse, io, hashlib
+import os, re, glob, math, time, random, gc, contextlib, argparse, io, hashlib
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Iterable, Any
 from datetime import datetime, timedelta
@@ -1266,41 +1266,54 @@ class TwoRadarFusionDataset(Dataset):
         self._warp_cache: Dict[Tuple[int, int], torch.Tensor] = {}
         self._warp_shape: Optional[Tuple[int, int]] = None
         self._warp_warned = False
-        ts_all = sorted(set([it["ts"] for it in self.A.items] + [it["ts"] for it in self.B.items]))
-        n = len(ts_all); n_val = max(1, int(n * val_split))
-        self.ts_list = ts_all[:n - n_val] if split == "train" else ts_all[n - n_val:]
+
+        step = int(self.dcfg.neighbor_minutes)
+        if step <= 0:
+            raise ValueError("neighbor_minutes must be positive")
+
+        offsets = (-step, 0, step)
+        ts_a = set(self.A.ts_to_path.keys())
+        ts_b = set(self.B.ts_to_path.keys())
+        common_ts = sorted(ts_a & ts_b)
+        strict_samples: Dict[int, Dict[str, List[int]]] = {}
+
+        for ts in common_ts:
+            dt = ts_to_dt(ts)
+            if dt.minute % step != 0:
+                continue
+
+            per_src: Dict[str, List[int]] = {}
+            valid = True
+            for label, source in (("A", self.A), ("B", self.B)):
+                seq: List[int] = []
+                for off in offsets:
+                    t = add_minutes(ts, off)
+                    if t not in source.ts_to_path:
+                        valid = False
+                        break
+                    seq.append(t)
+                if not valid:
+                    break
+                per_src[label] = seq
+            if valid:
+                strict_samples[ts] = per_src
+
+        ts_all = sorted(strict_samples.keys())
+        if not ts_all:
+            raise RuntimeError("No synchronized radar pairs with full neighbor context were found.")
+
+        n = len(ts_all)
+        n_val = max(1, int(n * val_split))
+        selected = ts_all[:n - n_val] if split == "train" else ts_all[n - n_val:]
+        if not selected:
+            split_name = "training" if split == "train" else "validation"
+            raise RuntimeError(f"No samples available for {split_name} split under strict timestamp alignment.")
+
+        self.ts_list = selected
+        self._sample_map = {ts: strict_samples[ts] for ts in selected}
         self._hc_cache: Dict[Tuple[int,int], Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
     def __len__(self): return len(self.ts_list)
-
-    def _tol_minutes(self, offset_min: int) -> int:
-        return max(MIN_TOL_MINUTES, int(abs(offset_min) * TOL_FRAC))
-
-    def _nearest_within(self, s: SourceData, target_ts: int, tol_min: int) -> Optional[int]:
-        if target_ts in s.ts_to_path: return target_ts
-        ts_list = s.ts_sorted
-        i = bisect.bisect_left(ts_list, target_ts)
-        best_t, best_dt = None, float("inf")
-        n = len(ts_list)
-        for off in range(0, 8):
-            any_within = False
-            idxs = (i - off, i + off) if off > 0 else (i,)
-            for j in idxs:
-                if 0 <= j < n:
-                    t = ts_list[j]
-                    dtmin = abs((ts_to_dt(t) - ts_to_dt(target_ts)).total_seconds() / 60.0)
-                    if dtmin <= tol_min:
-                        any_within = True
-                        if dtmin < best_dt:
-                            best_dt, best_t = dtmin, t
-            if off > 0 and not any_within:
-                break
-        return best_t
-
-    def _neighbor(self, s: SourceData, center_ts: int, offset_min: int) -> Optional[int]:
-        targ = add_minutes(center_ts, offset_min)
-        tol = self._tol_minutes(offset_min if offset_min != 0 else self.dcfg.neighbor_minutes)
-        return self._nearest_within(s, targ, tol)
 
     def _rand_view(self):
         flip_h = bool(torch.randint(0, 2, (1,)).item())
@@ -1473,55 +1486,30 @@ class TwoRadarFusionDataset(Dataset):
 
     def __getitem__(self, idx: int):
         ts = self.ts_list[idx]
-        offs = [-self.dcfg.neighbor_minutes, 0, +self.dcfg.neighbor_minutes]
-        a_ts = [self._neighbor(self.A, ts, o) for o in offs]
-        b_ts = [self._neighbor(self.B, ts, o) for o in offs]
-        if a_ts[1] is None and b_ts[1] is None:
-            step = self.dcfg.neighbor_minutes
-            found = False
-            for delta in range(step, step*5, step):
-                for cand in [add_minutes(ts, delta), add_minutes(ts, -delta)]:
-                    if self._nearest_within(self.A, cand, self._tol_minutes(0)) or self._nearest_within(self.B, cand, self._tol_minutes(0)):
-                        ts = cand
-                        a_ts = [self._neighbor(self.A, ts, o) for o in offs]
-                        b_ts = [self._neighbor(self.B, ts, o) for o in offs]
-                        found = True; break
-                if found: break
+        sample = self._sample_map[ts]
 
-        pairs: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
+        pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
         present_flags: List[float] = []
-        for tlist, S in [(a_ts, self.A), (b_ts, self.B)]:
-            for t in tlist:
-                if t is None:
-                    pairs.append(None)
-                    present_flags.append(0.0)
-                else:
-                    path = S.ts_to_path[t]
-                    m_np, inten_np = get_weak_label_cached(
-                        path,
-                        self.dcfg.hsv,
-                        self.dcfg.left_mask_px,
-                        device=self.dcfg.weak_label_device,
-                    )
-                    m_t = torch.from_numpy(m_np).to(torch.bool)
-                    inten_t = torch.from_numpy(inten_np).to(torch.float32)
-                    pairs.append((m_t, inten_t))
-                    present_flags.append(1.0)
+        for label, source in (("A", self.A), ("B", self.B)):
+            for t in sample[label]:
+                path = source.ts_to_path[t]
+                m_np, inten_np = get_weak_label_cached(
+                    path,
+                    self.dcfg.hsv,
+                    self.dcfg.left_mask_px,
+                    device=self.dcfg.weak_label_device,
+                )
+                m_t = torch.from_numpy(m_np).to(torch.bool)
+                inten_t = torch.from_numpy(inten_np).to(torch.float32)
+                pairs.append((m_t, inten_t))
+                present_flags.append(1.0)
 
         crop_sz = max(1, int(self.dcfg.crop))
-        shapes = [p[0].shape for p in pairs if p is not None]
-        if len(shapes) == 0:
-            H = W = crop_sz
-        else:
-            H = max(int(s[0]) for s in shapes)
-            W = max(int(s[1]) for s in shapes)
+        shapes = [p[0].shape for p in pairs]
+        H = max(int(s[0]) for s in shapes)
+        W = max(int(s[1]) for s in shapes)
 
         def resize_to_hw(pair):
-            if pair is None:
-                return (
-                    torch.zeros((H, W), dtype=torch.bool),
-                    torch.zeros((H, W), dtype=torch.float32),
-                )
             mask, inten = pair
             if mask.shape != (H, W):
                 mask = self._pad_to(mask, H, W, mode="replicate")
