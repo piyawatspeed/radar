@@ -364,6 +364,10 @@ def _apply_weak_label_config(cfg: Dict[str, Any]) -> HSVParams:
     hue_hi = float(simple_cfg.get("hue_hi", defaults.hue_hi))
     sat_min = float(simple_cfg.get("sat_min", defaults.sat_min))
     val_min = float(simple_cfg.get("val_min", defaults.val_min))
+    training_cfg.HSV_H_LO = hue_lo
+    training_cfg.HSV_H_HI = hue_hi
+    training_cfg.HSV_S_MIN = sat_min
+    training_cfg.HSV_V_MIN = val_min
     return HSVParams(hue_lo=hue_lo, hue_hi=hue_hi, sat_min=sat_min, val_min=val_min)
 
 
@@ -373,8 +377,12 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
         raise RuntimeError("CUDA device requested but CUDA is not available.")
 
     checkpoint = torch.load(args.checkpoint, map_location=device)
-    state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
-    cfg: Dict[str, Any] = checkpoint.get("cfg", {})
+    state_dict = checkpoint.get("model")
+    if state_dict is None:
+        state_dict = checkpoint.get("state_dict")
+    if state_dict is None:
+        state_dict = checkpoint
+    cfg: Dict[str, Any] = checkpoint.get("cfg") or checkpoint.get("config") or {}
 
     model_base = args.model_base if args.model_base is not None else cfg.get("base", 32)
     args.model_base = model_base
