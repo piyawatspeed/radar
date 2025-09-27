@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -382,6 +383,18 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
         state_dict = checkpoint.get("state_dict")
     if state_dict is None:
         state_dict = checkpoint
+    def _strip_prefix(sd: dict, prefix: str):
+        if not isinstance(sd, dict) or not sd:
+            return sd
+        keys = list(sd.keys())
+        if all(k.startswith(prefix) for k in keys):
+            return {k[len(prefix):]: v for k, v in sd.items()}
+        return sd
+
+    # Handle wrappers such as torch.compile that prepend "_orig_mod." or DDP's "module.".
+    state_dict = _strip_prefix(state_dict, "_orig_mod.")
+    state_dict = _strip_prefix(state_dict, "module.")
+
     cfg: Dict[str, Any] = checkpoint.get("cfg") or checkpoint.get("config") or {}
 
     model_base = args.model_base if args.model_base is not None else cfg.get("base", 32)
@@ -400,8 +413,33 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
     # Build timestamp indices and gather neighbors
     index_a = TimestampIndex(args.radar_a)
     index_b = TimestampIndex(args.radar_b)
-    paths_a = index_a.neighbor_triplet(args.timestamp, args.neighbor_minutes)
-    paths_b = index_b.neighbor_triplet(args.timestamp, args.neighbor_minutes)
+    anchor_ts = args.timestamp
+    paths_a = index_a.neighbor_triplet(anchor_ts, args.neighbor_minutes)
+    paths_b = index_b.neighbor_triplet(anchor_ts, args.neighbor_minutes)
+
+    if paths_a[1] is None and paths_b[1] is None:
+        step = max(1, args.neighbor_minutes)
+        tol_center = MIN_TOL_MINUTES
+        shifted = False
+        for delta in range(step, step * 5, step):
+            for direction in (1, -1):
+                candidate_ts = add_minutes(anchor_ts, delta * direction)
+                has_center_a = index_a.find_within(candidate_ts, tol_center) is not None
+                has_center_b = index_b.find_within(candidate_ts, tol_center) is not None
+                if has_center_a or has_center_b:
+                    anchor_ts = candidate_ts
+                    paths_a = index_a.neighbor_triplet(anchor_ts, args.neighbor_minutes)
+                    paths_b = index_b.neighbor_triplet(anchor_ts, args.neighbor_minutes)
+                    shifted = True
+                    break
+            if shifted:
+                print(
+                    "Both radars missing center frame; "
+                    f"shifted anchor from {args.timestamp} to {anchor_ts}"
+                )
+                break
+
+    args.anchor_timestamp = anchor_ts
 
     # Determine shared image shape
     image_shape = _infer_image_shape(paths_a + paths_b)
@@ -530,10 +568,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         args.out_cleaned_image = str(output_dir / f"cleaned_{timestamp}.png")
 
     prob_mask_np, cleaned_intensity_np = run_inference(args)
+    anchor_ts = getattr(args, "anchor_timestamp", args.timestamp)
     message = (
         "Successfully generated prediction. Mask shape: "
         f"{prob_mask_np.shape}, intensity shape: {cleaned_intensity_np.shape}"
     )
+    if anchor_ts != args.timestamp:
+        message += f". Anchor timestamp adjusted to {anchor_ts}"
     if args.out_cleaned_image:
         message += f". Cleaned image saved to {args.out_cleaned_image}"
     print(message)
