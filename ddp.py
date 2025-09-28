@@ -37,8 +37,70 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 from tqdm.auto import tqdm
+
+try:
+    from torch.cuda import CudaError as _TorchCudaError  # type: ignore
+except Exception:  # pragma: no cover - fallback when CUDA is unavailable
+    _TorchCudaError = RuntimeError
+
+_TorchAcceleratorError = getattr(torch, "AcceleratorError", RuntimeError)
+
+
+_PIN_MEMORY_ENABLED = torch.cuda.is_available()
+_PIN_MEMORY_WARNED = False
+_CUDA_FAILED = False
+_CUDA_WARNED = False
+_CUDA_READY = False
+
+
+def _maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+    global _PIN_MEMORY_ENABLED, _PIN_MEMORY_WARNED
+    if not _PIN_MEMORY_ENABLED:
+        return tensor
+    try:
+        return tensor.pin_memory()
+    except (_TorchCudaError, _TorchAcceleratorError, RuntimeError) as exc:
+        if not _PIN_MEMORY_WARNED:
+            print(f"⚠️  pin_memory disabled after failure: {exc}", flush=True)
+            _PIN_MEMORY_WARNED = True
+        _PIN_MEMORY_ENABLED = False
+        return tensor
+
+
+def _cuda_is_usable() -> bool:
+    global _CUDA_FAILED, _CUDA_WARNED, _PIN_MEMORY_ENABLED, _CUDA_READY
+    if _CUDA_FAILED:
+        return False
+    if _CUDA_READY:
+        return True
+    if not torch.cuda.is_available():
+        _PIN_MEMORY_ENABLED = False
+        _CUDA_FAILED = True
+        _CUDA_READY = False
+        return False
+    try:
+        torch.cuda.current_device()
+        try:
+            torch.cuda.mem_get_info()
+        except Exception:
+            try:
+                torch.empty(1, device="cuda")
+            except Exception:
+                raise
+        _CUDA_READY = True
+        return True
+    except (_TorchCudaError, _TorchAcceleratorError, RuntimeError) as exc:
+        if not _CUDA_WARNED:
+            print(f"⚠️  CUDA unavailable; falling back to CPU: {exc}", flush=True)
+            _CUDA_WARNED = True
+        _PIN_MEMORY_ENABLED = False
+        _CUDA_FAILED = True
+        _CUDA_READY = False
+        return False
+
 
 # ---------------- Global torch & PIL perf switches ----------------
 torch.backends.cudnn.benchmark = True
@@ -220,7 +282,7 @@ def ddp_setup():
     os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
     os.environ.setdefault("NCCL_DEBUG", "WARN")
     os.environ.setdefault("OMP_NUM_THREADS", "2")
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    backend = "nccl" if _cuda_is_usable() else "gloo"
     if backend == "nccl":
         torch.cuda.set_device(local_rank)
     dist.init_process_group(backend=backend, init_method="env://", timeout=timedelta(hours=2))
@@ -807,7 +869,7 @@ def _in_hue_range(H, lo, hi):
     return (H >= lo) & (H <= hi) if hi >= lo else ((H >= lo) | (H <= hi))
 
 def _morph_open_close_torch(mask_in, k: int = 3, device: str = "cpu") -> torch.Tensor:
-    use_cuda = device is not None and str(device).startswith("cuda") and torch.cuda.is_available()
+    use_cuda = device is not None and str(device).startswith("cuda") and _cuda_is_usable()
     dev = torch.device(device) if use_cuda else torch.device("cpu")
 
     if isinstance(mask_in, torch.Tensor):
@@ -835,7 +897,7 @@ def _morph_open_close_torch(mask_in, k: int = 3, device: str = "cpu") -> torch.T
     return closed.squeeze(0).squeeze(0).to(dtype=torch.bool)
 
 def _weak_label_core(img_rgb: np.ndarray, hsvp: HSVParams, left_mask_px: int, device: str = "cpu"):
-    use_cuda = device is not None and str(device).startswith("cuda") and torch.cuda.is_available()
+    use_cuda = device is not None and str(device).startswith("cuda") and _cuda_is_usable()
     dev = torch.device(device) if use_cuda else torch.device("cpu")
 
     arr = torch.as_tensor(img_rgb, dtype=torch.float32, device=dev) / 255.0
@@ -980,7 +1042,7 @@ def get_weak_label_cached(path: str, hsvp: HSVParams, left_mask_px: int = LEFT_M
     # Recompute (allowed only when strict off)
     img = imread_rgb(path)
     device_str = device if device is not None else WEAK_LABEL_DEVICE
-    if device_str != "cpu" and not torch.cuda.is_available():
+    if device_str != "cpu" and not _cuda_is_usable():
         device_str = "cpu"
     m, inten = _weak_label_core(img, hsvp, left_mask_px, device=device_str)
     if store:
@@ -1249,7 +1311,7 @@ class TwoRadarFusionDataset(Dataset):
         assert len(sources) == 2, "Provide exactly two radar sources."
         self.A, self.B = sources
         self.dcfg = dcfg or DataConfig()
-        if self.dcfg.weak_label_device != "cpu" and not torch.cuda.is_available():
+        if self.dcfg.weak_label_device != "cpu" and not _cuda_is_usable():
             self.dcfg.weak_label_device = "cpu"
         self.left_mask_px = int(self.dcfg.left_mask_px)
         self.warp_path = self.dcfg.warp_cache_path or warp_cache_path()
@@ -1644,11 +1706,10 @@ class TwoRadarFusionDataset(Dataset):
         y_dbz = y_dbz.to(torch.float32).unsqueeze(0)
         inpaint_mask = inpaint_mask.to(torch.float32).unsqueeze(0)
 
-        if torch.cuda.is_available():
-            x = x.pin_memory()
-            y_mask = y_mask.pin_memory()
-            y_dbz = y_dbz.pin_memory()
-            inpaint_mask = inpaint_mask.pin_memory()
+        x = _maybe_pin_memory(x)
+        y_mask = _maybe_pin_memory(y_mask)
+        y_dbz = _maybe_pin_memory(y_dbz)
+        inpaint_mask = _maybe_pin_memory(inpaint_mask)
 
         return {
             "x": x.contiguous(),
@@ -1762,7 +1823,7 @@ class EMA:
 # AMP & compile gate
 # ===========================
 def allow_compile():
-    if not torch.cuda.is_available(): return False
+    if not _cuda_is_usable(): return False
     major, minor = torch.cuda.get_device_capability()
     return major >= 8  # Ampere+/Ada (L4 OK)
 
@@ -1773,7 +1834,7 @@ def _gb(bytes_):
     return bytes_ / (1024**3)
 
 def _cuda_mem():
-    if not torch.cuda.is_available():
+    if not _cuda_is_usable():
         return 0.0, 0.0, 0.0
     alloc = torch.cuda.memory_allocated()
     reserv = torch.cuda.memory_reserved()
@@ -1849,8 +1910,8 @@ def _predict_tta(model, x, do_tta: bool):
 
 def bcast_float_from0(val: float) -> float:
     if not ddp_is_dist(): return val
-    if torch.cuda.is_available():
-        device = torch.device("cuda", torch.cuda.current_device())
+    if _cuda_is_usable():
+        device = torch.device("cuda")
     else:
         device = torch.device("cpu")
     t = torch.tensor([val], device=device)
@@ -1885,7 +1946,7 @@ def build_sources(rank=0):
 def make_loaders(sources, device, rank, world_size, num_workers, prefetch_factor,
                  warp_path: Optional[str] = None, do_inpaint: bool = False, inpaint_frac: float = 0.0):
     weak_dev = WEAK_LABEL_DEVICE
-    if weak_dev != "cpu" and not torch.cuda.is_available():
+    if weak_dev != "cpu" and not _cuda_is_usable():
         weak_dev = "cpu"
     common_cfg = dict(
         weak_label_device=weak_dev,
@@ -2522,7 +2583,7 @@ def stage_gpu_train(args):
     STRICT_ATLAS_ONLY = bool(args.strict_atlas_only)
 
     world_size, rank, local_rank = ddp_setup()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if _cuda_is_usable() else "cpu")
     if is_main(rank):
         print("DDP:", dict(world_size=world_size, rank=rank, local_rank=local_rank), flush=True)
 
@@ -2584,7 +2645,7 @@ def stage_gpu_train(args):
 
     ddp_cleanup()
     gc.collect()
-    if torch.cuda.is_available():
+    if _cuda_is_usable():
         torch.cuda.empty_cache()
 
 # ===========================
@@ -2642,6 +2703,10 @@ def parse_args():
     return p.parse_args()
 
 if __name__ == "__main__":
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
     args = parse_args()
     if getattr(args, "weak_cache_write_files", False):
         WEAK_CACHE_WRITE_FILES = True
