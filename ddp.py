@@ -1469,27 +1469,6 @@ class TwoRadarFusionDataset(Dataset):
             self._warp_cache[key] = resized.squeeze(0).permute(1, 2, 0).contiguous()
         return self._warp_cache[key].unsqueeze(0)
 
-    def _warp_triplet(self, inten_list, av_list, mask_list, target_shape: Tuple[int, int]):
-        grid = self._get_warp_grid(target_shape)
-        def _warp_stack(stack, mode):
-            if not stack:
-                return []
-            stacked = torch.stack(stack, dim=0).unsqueeze(1).to(torch.float32)
-            g = grid.to(stacked.device)
-            if g.shape[0] != stacked.shape[0]:
-                g = g.expand(stacked.shape[0], -1, -1, -1)
-            warped = F.grid_sample(stacked, g, mode=mode, padding_mode="zeros", align_corners=False)
-            return [t.contiguous() for t in warped.squeeze(1)]
-
-        inten_out = _warp_stack(inten_list, mode="bilinear")
-        av_out = _warp_stack(av_list, mode="bilinear")
-        mask_out = None
-        if mask_list is not None:
-            mask_float = [m.to(torch.float32) for m in mask_list]
-            mask_warp = _warp_stack(mask_float, mode="bilinear")
-            mask_out = [m > 0.5 for m in mask_warp]
-        return inten_out, av_out, mask_out
-
     def _pad_to(self, tensor: torch.Tensor, th: int, tw: int, mode: str = "reflect", value: float = 0.0):
         ph = max(0, th - tensor.shape[-2])
         pw = max(0, tw - tensor.shape[-1])
@@ -1619,11 +1598,7 @@ class TwoRadarFusionDataset(Dataset):
         base_shape_a = tuple(int(x) for x in (a_base_shape if a_base_shape is not None else (H, W)))
         base_shape_b = tuple(int(x) for x in (b_base_shape if b_base_shape is not None else (H, W)))
         self._ensure_warp_base(base_shape_a, base_shape_b)
-        intenB, avB, maskB_list = self._warp_triplet(intenB, avB, maskB_list, (H, W))
-        if maskB_list:
-            maskB_t = maskB_list[1]
-        if intenB:
-            intenB_t = intenB[1]
+        warp_grid = self._get_warp_grid((H, W)).squeeze(0)
 
         if self.dcfg.fuse_mode == "mean":
             availA_t = avA[1]
@@ -1674,6 +1649,7 @@ class TwoRadarFusionDataset(Dataset):
         y_mask = self._apply_view(y_mask, view)
         y_dbz = self._apply_view(y_dbz, view)
         inpaint_mask = self._apply_view(inpaint_mask, view)
+        warp_grid = self._apply_view(warp_grid.permute(2, 0, 1), view).permute(1, 2, 0)
 
         target_h = max(crop_sz, max(int(ch.shape[0]) for ch in chs))
         target_w = max(crop_sz, max(int(ch.shape[1]) for ch in chs))
@@ -1681,6 +1657,9 @@ class TwoRadarFusionDataset(Dataset):
         y_mask = self._pad_to(y_mask, target_h, target_w, mode="reflect")
         y_dbz = self._pad_to(y_dbz, target_h, target_w, mode="reflect")
         inpaint_mask = self._pad_to(inpaint_mask, target_h, target_w, mode="constant", value=0.0)
+        warp_grid_ch = []
+        for c in range(warp_grid.shape[-1]):
+            warp_grid_ch.append(self._pad_to(warp_grid[..., c], target_h, target_w, mode="replicate"))
 
         crop = crop_sz
         y0, x0 = self._choose_crop(chs, y_mask, crop)
@@ -1688,22 +1667,26 @@ class TwoRadarFusionDataset(Dataset):
         y_mask = y_mask[y0:y0+crop, x0:x0+crop]
         y_dbz = y_dbz[y0:y0+crop, x0:x0+crop]
         inpaint_mask = inpaint_mask[y0:y0+crop, x0:x0+crop]
+        warp_grid = torch.stack([wg[y0:y0+crop, x0:x0+crop] for wg in warp_grid_ch], dim=-1)
 
         x = torch.stack(chs, dim=0).to(torch.float32)
         y_mask = y_mask.to(torch.float32).unsqueeze(0)
         y_dbz = y_dbz.to(torch.float32).unsqueeze(0)
         inpaint_mask = inpaint_mask.to(torch.float32).unsqueeze(0)
+        warp_grid = warp_grid.to(torch.float32)
 
         x = _maybe_pin_memory(x)
         y_mask = _maybe_pin_memory(y_mask)
         y_dbz = _maybe_pin_memory(y_dbz)
         inpaint_mask = _maybe_pin_memory(inpaint_mask)
+        warp_grid = _maybe_pin_memory(warp_grid)
 
         return {
             "x": x.contiguous(),
             "y_mask": y_mask.contiguous(),
             "y_dbz": y_dbz.contiguous(),
             "inpaint_mask": inpaint_mask.contiguous(),
+            "warp_grid": warp_grid.contiguous(),
         }
 
 # ===========================
@@ -2019,8 +2002,30 @@ def _update_swa_bn_stats(train_ds, device, swa_model, batch_size, rank):
             def __iter__(self):
                 non_blocking = (self.device.type == "cuda")
                 for batch in self.base_loader:
-                    x = batch["x"].to(self.device, non_blocking=non_blocking)
-                    yield x.contiguous(memory_format=torch.channels_last)
+                    x_unwarped = batch["x"].to(self.device, non_blocking=non_blocking)
+                    warp_grid = batch["warp_grid"].to(self.device, non_blocking=non_blocking)
+                    warp_grid = warp_grid.to(x_unwarped.dtype)
+
+                    def _warp_on_device(tensor_stack: torch.Tensor) -> torch.Tensor:
+                        return F.grid_sample(
+                            tensor_stack,
+                            warp_grid,
+                            mode="bilinear",
+                            padding_mode="zeros",
+                            align_corners=False,
+                        )
+
+                    intenA = x_unwarped[:, 0:3, :, :]
+                    intenB_unwarped = x_unwarped[:, 3:6, :, :]
+                    avA = x_unwarped[:, 6:9, :, :]
+                    avB_unwarped = x_unwarped[:, 9:12, :, :]
+                    helpers = x_unwarped[:, 12:15, :, :]
+
+                    intenB = _warp_on_device(intenB_unwarped)
+                    avB = _warp_on_device(avB_unwarped)
+
+                    x = torch.cat([intenA, intenB, avA, avB, helpers], dim=1).contiguous()
+                    yield x.to(memory_format=torch.channels_last)
 
             def __len__(self):
                 return len(self.base_loader)
@@ -2179,13 +2184,36 @@ def run_training(hparams, device, rank, local_rank, world_size,
 
         for step, batch in enumerate(bar, 1):
             iter_t0 = time.time()
-            x = batch["x"].to(device, non_blocking=(device.type=="cuda")).contiguous(memory_format=torch.channels_last)
+            x_unwarped = batch["x"].to(device, non_blocking=(device.type=="cuda"))
+            warp_grid_gpu = batch["warp_grid"].to(device, non_blocking=(device.type=="cuda"))
+            warp_grid_gpu = warp_grid_gpu.to(x_unwarped.dtype)
             y_mask_raw = batch["y_mask"].to(device, non_blocking=(device.type=="cuda"))
             y_mask = y_mask_raw if LABEL_SMOOTH_EPS <= 0 else y_mask_raw*(1.0 - LABEL_SMOOTH_EPS) + 0.5*LABEL_SMOOTH_EPS
             y_dbz = batch["y_dbz"].to(device, non_blocking=(device.type=="cuda"))
             inpaint_mask = batch.get("inpaint_mask")
             if inpaint_mask is not None:
                 inpaint_mask = inpaint_mask.to(device, non_blocking=(device.type=="cuda"))
+
+            def _warp_on_device(tensor_stack: torch.Tensor) -> torch.Tensor:
+                return F.grid_sample(
+                    tensor_stack,
+                    warp_grid_gpu,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=False,
+                )
+
+            intenA = x_unwarped[:, 0:3, :, :]
+            intenB_unwarped = x_unwarped[:, 3:6, :, :]
+            avA = x_unwarped[:, 6:9, :, :]
+            avB_unwarped = x_unwarped[:, 9:12, :, :]
+            helpers = x_unwarped[:, 12:15, :, :]
+
+            intenB = _warp_on_device(intenB_unwarped)
+            avB = _warp_on_device(avB_unwarped)
+
+            x = torch.cat([intenA, intenB, avA, avB, helpers], dim=1).contiguous()
+            x = x.to(memory_format=torch.channels_last)
 
             loss_inpaint = torch.zeros((), device=device)
             with (torch.amp.autocast("cuda", dtype=(torch.bfloat16 if (device.type=="cuda" and torch.cuda.is_bf16_supported()) else torch.float16), enabled=(device.type=="cuda" and MIXED_PRECISION)) if device.type=="cuda" else contextlib.nullcontext()):
@@ -2258,13 +2286,36 @@ def run_training(hparams, device, rank, local_rank, world_size,
             with torch.no_grad():
                 for batch in barv:
                     iter_t0 = time.time()
-                    x = batch["x"].to(device, non_blocking=(device.type=="cuda")).contiguous(memory_format=torch.channels_last)
+                    x_unwarped = batch["x"].to(device, non_blocking=(device.type=="cuda"))
+                    warp_grid_gpu = batch["warp_grid"].to(device, non_blocking=(device.type=="cuda"))
+                    warp_grid_gpu = warp_grid_gpu.to(x_unwarped.dtype)
                     y_mask_raw = batch["y_mask"].to(device, non_blocking=(device.type=="cuda"))
                     y_mask = y_mask_raw if LABEL_SMOOTH_EPS <= 0 else y_mask_raw*(1.0 - LABEL_SMOOTH_EPS) + 0.5*LABEL_SMOOTH_EPS
                     y_dbz = batch["y_dbz"].to(device, non_blocking=(device.type=="cuda"))
                     inpaint_mask = batch.get("inpaint_mask")
                     if inpaint_mask is not None:
                         inpaint_mask = inpaint_mask.to(device, non_blocking=(device.type=="cuda"))
+
+                    def _warp_on_device(tensor_stack: torch.Tensor) -> torch.Tensor:
+                        return F.grid_sample(
+                            tensor_stack,
+                            warp_grid_gpu,
+                            mode="bilinear",
+                            padding_mode="zeros",
+                            align_corners=False,
+                        )
+
+                    intenA = x_unwarped[:, 0:3, :, :]
+                    intenB_unwarped = x_unwarped[:, 3:6, :, :]
+                    avA = x_unwarped[:, 6:9, :, :]
+                    avB_unwarped = x_unwarped[:, 9:12, :, :]
+                    helpers = x_unwarped[:, 12:15, :, :]
+
+                    intenB = _warp_on_device(intenB_unwarped)
+                    avB = _warp_on_device(avB_unwarped)
+
+                    x = torch.cat([intenA, intenB, avA, avB, helpers], dim=1).contiguous()
+                    x = x.to(memory_format=torch.channels_last)
                     if device.type == "cuda":
                         with torch.amp.autocast("cuda", dtype=(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16), enabled=MIXED_PRECISION):
                             logits, dbz_pred = _predict_tta(m, x, do_tta=do_tta)
