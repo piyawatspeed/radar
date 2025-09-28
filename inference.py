@@ -158,7 +158,7 @@ def _discover_radar_dirs(
     radar_a_override: Optional[str],
     radar_b_override: Optional[str],
 ) -> Tuple[Path, Path]:
-    data_root = _validate_dir(data_root, "Data root")
+    data_root = Path(data_root)
 
     def _resolve_override(override: Optional[str]) -> Optional[Path]:
         if override is None:
@@ -182,8 +182,10 @@ def _discover_radar_dirs(
     if resolved_a_real is not None and resolved_b_real is not None:
         if resolved_a_real == resolved_b_real:
             raise RuntimeError("Radar A and Radar B directories must be distinct.")
+        return resolved_a, resolved_b
 
-    remaining = [p for p in sorted(data_root.iterdir()) if p.is_dir()]
+    data_root_validated = _validate_dir(data_root, "Data root")
+    remaining = [p for p in sorted(data_root_validated.iterdir()) if p.is_dir()]
 
     def _consume(path: Path) -> None:
         for idx, candidate in enumerate(list(remaining)):
