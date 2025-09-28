@@ -186,40 +186,108 @@ def _discover_radar_dirs(
 
     data_root_validated = _validate_dir(data_root, "Data root")
     remaining = [p for p in sorted(data_root_validated.iterdir()) if p.is_dir()]
+    candidates = list(remaining)
+
+    def _canonical(path: Path) -> Path:
+        try:
+            return path.resolve()
+        except FileNotFoundError:
+            return path
+
+    def _matching_dirs(items: Sequence[Path], preferred_id: Optional[str]) -> List[Path]:
+        if not preferred_id:
+            return []
+        tid = preferred_id.lower()
+        return [candidate for candidate in items if tid in candidate.name.lower()]
+
+    matches_a_all = _matching_dirs(candidates, RADAR_A_ID)
+    matches_b_all = _matching_dirs(candidates, RADAR_B_ID)
+
+    matches_a_resolved = {_canonical(path) for path in matches_a_all}
+    matches_b_resolved = {_canonical(path) for path in matches_b_all}
+
+    if (
+        resolved_a is None
+        and resolved_b is None
+        and matches_a_resolved
+        and matches_b_resolved
+        and not any(
+            a_path != b_path
+            for a_path in matches_a_resolved
+            for b_path in matches_b_resolved
+        )
+    ):
+        shared = ", ".join(sorted(path.name for path in matches_a_all))
+        raise RuntimeError(
+            "Unable to infer distinct radar directories: folders matching both "
+            f"'{RADAR_A_ID}' and '{RADAR_B_ID}' identifiers overlap ({shared}). "
+            "Specify --radar-a/--radar-b to disambiguate."
+        )
+
+    if (
+        resolved_a is not None
+        and resolved_b is None
+        and matches_b_resolved
+        and all(path == resolved_a_real for path in matches_b_resolved)
+    ):
+        match_names = ", ".join(sorted(path.name for path in matches_b_all))
+        raise RuntimeError(
+            "Unable to infer Radar B directory because the only matching candidates "
+            f"({match_names}) resolve to the Radar A override '{resolved_a}'. "
+            "Specify --radar-b to disambiguate."
+        )
+
+    if (
+        resolved_b is not None
+        and resolved_a is None
+        and matches_a_resolved
+        and all(path == resolved_b_real for path in matches_a_resolved)
+    ):
+        match_names = ", ".join(sorted(path.name for path in matches_a_all))
+        raise RuntimeError(
+            "Unable to infer Radar A directory because the only matching candidates "
+            f"({match_names}) resolve to the Radar B override '{resolved_b}'. "
+            "Specify --radar-a to disambiguate."
+        )
+
+    def _same_path(path_a: Path, path_b: Path) -> bool:
+        try:
+            return path_a.resolve() == path_b.resolve()
+        except FileNotFoundError:
+            return path_a == path_b
 
     def _consume(path: Path) -> None:
         for idx, candidate in enumerate(list(remaining)):
-            try:
-                if candidate.resolve() == path.resolve():
-                    remaining.pop(idx)
-                    return
-            except FileNotFoundError:
-                if candidate == path:
-                    remaining.pop(idx)
-                    return
-
-    def _match_preferred(candidate: Path, target_id: Optional[str]) -> bool:
-        if not target_id:
-            return False
-        name = candidate.name.lower()
-        tid = target_id.lower()
-        if name == tid:
-            return True
-        tokens = {part for part in name.replace("-", "_").split("_") if part}
-        tokens.add(name)
-        if tid in tokens:
-            return True
-        return tid in name
+            if _same_path(candidate, path):
+                remaining.pop(idx)
+                return
 
     def _pick_default(label: str, existing: Optional[Path], preferred_id: Optional[str]) -> Path:
         if existing is not None:
             _consume(existing)
             return existing
-        for idx, candidate in enumerate(remaining):
-            if _match_preferred(candidate, preferred_id):
-                return remaining.pop(idx)
+
+        if preferred_id:
+            tid = preferred_id.lower()
+            matches = [
+                candidate
+                for candidate in remaining
+                if tid in candidate.name.lower()
+            ]
+            if len(matches) > 1:
+                match_names = ", ".join(sorted(p.name for p in matches))
+                raise RuntimeError(
+                    "Multiple candidate directories in "
+                    f"'{data_root}' match Radar {label.upper()} identifier '{preferred_id}': {match_names}. "
+                    "Specify --radar-{} to disambiguate.".format(label)
+                )
+            if len(matches) == 1:
+                remaining.remove(matches[0])
+                return matches[0]
+
         if remaining:
             return remaining.pop(0)
+
         raise RuntimeError(
             f"Unable to locate a default directory for Radar {label.upper()} in '{data_root}'."
         )
