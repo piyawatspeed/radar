@@ -1892,10 +1892,23 @@ def lr_range_test(model, train_loader, device, loss_focal, steps=LR_FINDER_STEPS
         avB_unwarped = x_unwarped[:, 9:12, :, :]
         helpers = x_unwarped[:, 12:15, :, :]
 
-        intenB = _warp_on_device(intenB_unwarped)
-        avB = _warp_on_device(avB_unwarped)
-        maskB_warp = torch.clamp(_warp_on_device(maskB_t), 0.0, 1.0)
-        availB_warp = torch.clamp(_warp_on_device(availB_t), 0.0, 1.0)
+        radarB_unwarped = torch.cat(
+            [intenB_unwarped, avB_unwarped, maskB_t, availB_t], dim=1
+        ).contiguous()
+        radarB_warped = _warp_on_device(radarB_unwarped)
+        split_sizes = [
+            intenB_unwarped.size(1),
+            avB_unwarped.size(1),
+            maskB_t.size(1),
+            availB_t.size(1),
+        ]
+        intenB, avB, maskB_warp, availB_warp = torch.split(
+            radarB_warped, split_sizes, dim=1
+        )
+        intenB = intenB.contiguous()
+        avB = avB.contiguous()
+        maskB_warp = torch.clamp(maskB_warp.contiguous(), 0.0, 1.0)
+        availB_warp = torch.clamp(availB_warp.contiguous(), 0.0, 1.0)
         maskA_t = torch.clamp(maskA_t, 0.0, 1.0)
         availA_t = torch.clamp(availA_t, 0.0, 1.0)
 
@@ -2102,8 +2115,15 @@ def _update_swa_bn_stats(train_ds, device, swa_model, batch_size, rank):
                     avB_unwarped = x_unwarped[:, 9:12, :, :]
                     helpers = x_unwarped[:, 12:15, :, :]
 
-                    intenB = _warp_on_device(intenB_unwarped)
-                    avB = _warp_on_device(avB_unwarped)
+                    radarB_unwarped = torch.cat([intenB_unwarped, avB_unwarped], dim=1).contiguous()
+                    radarB_warped = _warp_on_device(radarB_unwarped)
+                    intenB, avB = torch.split(
+                        radarB_warped,
+                        [intenB_unwarped.size(1), avB_unwarped.size(1)],
+                        dim=1,
+                    )
+                    intenB = intenB.contiguous()
+                    avB = avB.contiguous()
 
                     x = torch.cat([intenA, intenB, avA, avB, helpers], dim=1).contiguous()
                     yield x.to(memory_format=torch.channels_last)
@@ -2293,14 +2313,25 @@ def run_training(hparams, device, rank, local_rank, world_size,
             avB_unwarped = x_unwarped[:, 9:12, :, :]
             helpers = x_unwarped[:, 12:15, :, :]
 
-            intenB = _warp_on_device(intenB_unwarped)
-            avB = _warp_on_device(avB_unwarped)
-
-            maskB_warp = torch.clamp(_warp_on_device(maskB_t), 0.0, 1.0)
-            availB_warp = _warp_on_device(availB_t)
+            radarB_unwarped = torch.cat(
+                [intenB_unwarped, avB_unwarped, maskB_t, availB_t], dim=1
+            ).contiguous()
+            radarB_warped = _warp_on_device(radarB_unwarped)
+            split_sizes = [
+                intenB_unwarped.size(1),
+                avB_unwarped.size(1),
+                maskB_t.size(1),
+                availB_t.size(1),
+            ]
+            intenB, avB, maskB_warp, availB_warp = torch.split(
+                radarB_warped, split_sizes, dim=1
+            )
+            intenB = intenB.contiguous()
+            avB = avB.contiguous()
+            maskB_warp = torch.clamp(maskB_warp.contiguous(), 0.0, 1.0)
+            availB_warp = torch.clamp(availB_warp.contiguous(), 0.0, 1.0)
             maskA_t = torch.clamp(maskA_t, 0.0, 1.0)
             availA_t = torch.clamp(availA_t, 0.0, 1.0)
-            availB_warp = torch.clamp(availB_warp, 0.0, 1.0)
 
             x = torch.cat([intenA, intenB, avA, avB, helpers], dim=1).contiguous()
             x = x.to(memory_format=torch.channels_last)
@@ -2427,14 +2458,25 @@ def run_training(hparams, device, rank, local_rank, world_size,
                     avB_unwarped = x_unwarped[:, 9:12, :, :]
                     helpers = x_unwarped[:, 12:15, :, :]
 
-                    intenB = _warp_on_device(intenB_unwarped)
-                    avB = _warp_on_device(avB_unwarped)
-
-                    maskB_warp = torch.clamp(_warp_on_device(maskB_t), 0.0, 1.0)
-                    availB_warp = _warp_on_device(availB_t)
+                    radarB_unwarped = torch.cat(
+                        [intenB_unwarped, avB_unwarped, maskB_t, availB_t], dim=1
+                    ).contiguous()
+                    radarB_warped = _warp_on_device(radarB_unwarped)
+                    split_sizes = [
+                        intenB_unwarped.size(1),
+                        avB_unwarped.size(1),
+                        maskB_t.size(1),
+                        availB_t.size(1),
+                    ]
+                    intenB, avB, maskB_warp, availB_warp = torch.split(
+                        radarB_warped, split_sizes, dim=1
+                    )
+                    intenB = intenB.contiguous()
+                    avB = avB.contiguous()
+                    maskB_warp = torch.clamp(maskB_warp.contiguous(), 0.0, 1.0)
+                    availB_warp = torch.clamp(availB_warp.contiguous(), 0.0, 1.0)
                     maskA_t = torch.clamp(maskA_t, 0.0, 1.0)
                     availA_t = torch.clamp(availA_t, 0.0, 1.0)
-                    availB_warp = torch.clamp(availB_warp, 0.0, 1.0)
 
                     x = torch.cat([intenA, intenB, avA, avB, helpers], dim=1).contiguous()
                     x = x.to(memory_format=torch.channels_last)
