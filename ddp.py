@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 from tqdm.auto import tqdm
 
@@ -1968,6 +1969,7 @@ def make_loaders(sources, device, rank, world_size, num_workers, prefetch_factor
         if num_workers > 0:
             kwargs["persistent_workers"] = PERSISTENT_WORKERS
             kwargs["prefetch_factor"] = prefetch_factor
+            kwargs["multiprocessing_context"] = "spawn"
         return DataLoader(**kwargs)
 
     train_loader = mk(train_ds, BATCH_SIZE, shuffle=(train_sampler is None), sampler=train_sampler)
@@ -2689,6 +2691,7 @@ def parse_args():
     return p.parse_args()
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     args = parse_args()
     if getattr(args, "weak_cache_write_files", False):
         WEAK_CACHE_WRITE_FILES = True
