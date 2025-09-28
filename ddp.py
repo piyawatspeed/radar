@@ -246,6 +246,7 @@ MIXED_PRECISION = True
 WEIGHT_DECAY = 1e-4
 LAMBDA_DBZ = 1.0
 DICE_WEIGHT = 0.5
+FUSE_MODE = "max"             # default fusion strategy for radar intensities
 LOG_EVERY = 100
 CKPT_PATH = os.path.join(WORK_DIR, "radar_cleaner_best.pt")
 
