@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 import os, re, glob, math, time, random, gc, contextlib, argparse, io, hashlib
+from functools import partial
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Iterable, Any
 from datetime import datetime, timedelta
@@ -1930,6 +1931,13 @@ def build_sources(rank=0):
         print("⚠️  Could not infer radar ordering from folder names; using provided order.", flush=True)
     return sources
 
+def _seed_worker(worker_id: int, base_seed: int, rank: int) -> None:
+    seed = base_seed + worker_id + rank * 1000
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+
 def make_loaders(sources, device, rank, world_size, num_workers, prefetch_factor,
                  warp_path: Optional[str] = None, do_inpaint: bool = False, inpaint_frac: float = 0.0):
     weak_dev = WEAK_LABEL_DEVICE
@@ -1953,18 +1961,13 @@ def make_loaders(sources, device, rank, world_size, num_workers, prefetch_factor
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False) if ddp_is_dist() else None
     val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=rank, shuffle=False, drop_last=False) if ddp_is_dist() else None
 
-    def _wif(worker_id):
-        seed = SEED + worker_id + rank*1000
-        np.random.seed(seed)
-        random.seed(seed)
-        torch.manual_seed(seed)
-
     g = torch.Generator(); g.manual_seed(SEED + rank)
     pin = (device.type == "cuda")
+    worker_init = partial(_seed_worker, base_seed=SEED, rank=rank)
 
     def mk(ds, bs, shuffle, sampler):
         kwargs = dict(dataset=ds, batch_size=bs, shuffle=shuffle, sampler=sampler,
-                      num_workers=num_workers, pin_memory=pin, worker_init_fn=_wif,
+                      num_workers=num_workers, pin_memory=pin, worker_init_fn=worker_init,
                       generator=g, drop_last=False)
         if num_workers > 0:
             kwargs["persistent_workers"] = PERSISTENT_WORKERS
