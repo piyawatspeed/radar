@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -29,6 +30,8 @@ from ddp import (
     LEFT_MASK_PX,
     MIN_TOL_MINUTES,
     NEIGHBOR_MINUTES,
+    RADAR_A_ID,
+    RADAR_B_ID,
     TOL_FRAC,
     HSVParams,
     TinyUNet,
@@ -177,7 +180,7 @@ def _discover_radar_dirs(
     radar_a_override: Optional[str],
     radar_b_override: Optional[str],
 ) -> Tuple[Path, Path]:
-    data_root = _validate_dir(data_root, "Data root")
+    data_root = Path(data_root)
 
     def _resolve_override(override: Optional[str]) -> Optional[Path]:
         if override is None:
@@ -191,21 +194,68 @@ def _discover_radar_dirs(
     resolved_a = _resolve_override(radar_a_override)
     resolved_b = _resolve_override(radar_b_override)
 
-    remaining = [p for p in sorted(data_root.iterdir()) if p.is_dir()]
+    try:
+        resolved_a_real = resolved_a.resolve() if resolved_a is not None else None
+        resolved_b_real = resolved_b.resolve() if resolved_b is not None else None
+    except FileNotFoundError:
+        resolved_a_real = resolved_a
+        resolved_b_real = resolved_b
 
-    def _pick_default(label: str, existing: Optional[Path]) -> Path:
+    if resolved_a_real is not None and resolved_b_real is not None:
+        if resolved_a_real == resolved_b_real:
+            raise RuntimeError("Radar A and Radar B directories must be distinct.")
+        return resolved_a, resolved_b
+
+    data_root_validated = _validate_dir(data_root, "Data root")
+    remaining = [p for p in sorted(data_root_validated.iterdir()) if p.is_dir()]
+
+    def _consume(path: Path) -> None:
+        for idx, candidate in enumerate(list(remaining)):
+            try:
+                if candidate.resolve() == path.resolve():
+                    remaining.pop(idx)
+                    return
+            except FileNotFoundError:
+                if candidate == path:
+                    remaining.pop(idx)
+                    return
+
+    def _match_preferred(candidate: Path, target_id: Optional[str]) -> bool:
+        if not target_id:
+            return False
+        name = candidate.name.lower()
+        tid = target_id.lower()
+        if name == tid:
+            return True
+        tokens = {part for part in name.replace("-", "_").split("_") if part}
+        tokens.add(name)
+        if tid in tokens:
+            return True
+        return tid in name
+
+    def _pick_default(label: str, existing: Optional[Path], preferred_id: Optional[str]) -> Path:
         if existing is not None:
+            _consume(existing)
             return existing
-        while remaining:
-            candidate = remaining.pop(0)
-            if candidate != resolved_a and candidate != resolved_b:
-                return candidate
+        for idx, candidate in enumerate(remaining):
+            if _match_preferred(candidate, preferred_id):
+                return remaining.pop(idx)
+        if remaining:
+            return remaining.pop(0)
         raise RuntimeError(
             f"Unable to locate a default directory for Radar {label.upper()} in '{data_root}'."
         )
 
-    radar_a = _pick_default("a", resolved_a)
-    radar_b = _pick_default("b", resolved_b)
+    radar_a = _pick_default("a", resolved_a, RADAR_A_ID)
+    radar_b = _pick_default("b", resolved_b, RADAR_B_ID)
+
+    try:
+        same_location = radar_a.resolve() == radar_b.resolve()
+    except FileNotFoundError:
+        same_location = radar_a == radar_b
+    if same_location:
+        raise RuntimeError("Radar A and Radar B directories resolved to the same location.")
+
     return radar_a, radar_b
 
 
@@ -251,20 +301,43 @@ def _discover_atlases(
     resolved_a = _resolve(atlas_a)
     resolved_b = _resolve(atlas_b)
 
-    if resolved_a is not None or resolved_b is not None:
+    if resolved_a is not None and resolved_b is not None:
         return resolved_a, resolved_b
 
     if not atlas_dir.exists():
-        return None, None
+        return resolved_a, resolved_b
     if not atlas_dir.is_dir():
         raise NotADirectoryError(f"Atlas directory '{atlas_dir}' is not a directory.")
 
     matches = sorted(atlas_dir.glob(DEFAULT_ATLAS_PATTERN))
     if not matches:
-        return None, None
-    if len(matches) == 1:
-        return matches[0], None
-    return matches[0], matches[1]
+        return resolved_a, resolved_b
+
+    available = list(matches)
+
+    def _same_path(path_a: Path, path_b: Path) -> bool:
+        try:
+            return path_a.resolve() == path_b.resolve()
+        except FileNotFoundError:
+            return path_a == path_b
+
+    def _consume(path: Optional[Path]) -> None:
+        if path is None:
+            return
+        for idx, candidate in enumerate(list(available)):
+            if _same_path(candidate, path):
+                available.pop(idx)
+                break
+
+    _consume(resolved_a)
+    _consume(resolved_b)
+
+    if resolved_a is None and available:
+        resolved_a = available.pop(0)
+    if resolved_b is None and available:
+        resolved_b = available.pop(0)
+
+    return resolved_a, resolved_b
 
 
 def _infer_image_shape(

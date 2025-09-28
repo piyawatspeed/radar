@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 import os, re, glob, math, time, random, gc, contextlib, argparse, io, hashlib
+from functools import partial
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Iterable, Any
 from datetime import datetime, timedelta
@@ -37,8 +38,98 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 from tqdm.auto import tqdm
+
+try:
+    from torch.cuda import CudaError as _TorchCudaError  # type: ignore
+except Exception:  # pragma: no cover - fallback when CUDA is unavailable
+    _TorchCudaError = RuntimeError
+
+_TorchAcceleratorError = getattr(torch, "AcceleratorError", RuntimeError)
+
+
+_PIN_MEMORY_ENABLED = torch.cuda.is_available()
+_PIN_MEMORY_WARNED = False
+_CUDA_FAILED = False
+_CUDA_WARNED = False
+
+
+def _maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+    global _PIN_MEMORY_ENABLED, _PIN_MEMORY_WARNED
+    if not _PIN_MEMORY_ENABLED:
+        return tensor
+    try:
+        return tensor.pin_memory()
+    except (_TorchCudaError, _TorchAcceleratorError, RuntimeError) as exc:
+        if not _PIN_MEMORY_WARNED:
+            print(f"⚠️  pin_memory disabled after failure: {exc}", flush=True)
+            _PIN_MEMORY_WARNED = True
+        _PIN_MEMORY_ENABLED = False
+        return tensor
+
+
+def _cuda_is_usable() -> bool:
+    global _CUDA_FAILED, _CUDA_WARNED, _PIN_MEMORY_ENABLED
+    if _CUDA_FAILED:
+        return False
+    if not torch.cuda.is_available():
+        _PIN_MEMORY_ENABLED = False
+        _CUDA_FAILED = True
+        return False
+    try:
+        torch.cuda.current_device()
+        return True
+    except (_TorchCudaError, _TorchAcceleratorError, RuntimeError) as exc:
+        if not _CUDA_WARNED:
+            print(f"⚠️  CUDA unavailable; falling back to CPU: {exc}", flush=True)
+            _CUDA_WARNED = True
+        _PIN_MEMORY_ENABLED = False
+        _CUDA_FAILED = True
+        return False
+
+
+# ---------------- Inpainting helper ----------------
+def _apply_inpaint_on_device(
+    intenA: torch.Tensor,
+    intenB: torch.Tensor,
+    avA: torch.Tensor,
+    avB: torch.Tensor,
+    availA_center: torch.Tensor,
+    availB_center: torch.Tensor,
+    do_flag: bool,
+    frac: float,
+    left_px: int,
+) -> Optional[torch.Tensor]:
+    """Sample inpainting holes and zero masked channels on the current device."""
+    if not (do_flag and frac > 0.0):
+        return None
+
+    allowed = torch.logical_or(availA_center > 0.0, availB_center > 0.0)
+    allowed = allowed.to(torch.bool)
+
+    if allowed.shape[-1] > left_px:
+        allowed[..., :left_px] = False
+    else:
+        allowed.zero_()
+
+    if not bool(allowed.any().item()):
+        return torch.zeros_like(availA_center, dtype=availA_center.dtype)
+
+    noise = torch.rand(allowed.shape, device=availA_center.device)
+    holes = torch.logical_and(noise < frac, allowed)
+
+    if bool(holes.any().item()):
+        intenA[:, 1:2, :, :].masked_fill_(holes, 0.0)
+        intenB[:, 1:2, :, :].masked_fill_(holes, 0.0)
+        avA[:, 1:2, :, :].masked_fill_(holes, 0.0)
+        avB[:, 1:2, :, :].masked_fill_(holes, 0.0)
+        availA_center.masked_fill_(holes, 0.0)
+        availB_center.masked_fill_(holes, 0.0)
+
+    return holes.to(availA_center.dtype)
+
 
 # ---------------- Global torch & PIL perf switches ----------------
 torch.backends.cudnn.benchmark = True
@@ -220,7 +311,7 @@ def ddp_setup():
     os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
     os.environ.setdefault("NCCL_DEBUG", "WARN")
     os.environ.setdefault("OMP_NUM_THREADS", "2")
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    backend = "nccl" if _cuda_is_usable() else "gloo"
     if backend == "nccl":
         torch.cuda.set_device(local_rank)
     dist.init_process_group(backend=backend, init_method="env://", timeout=timedelta(hours=2))
@@ -807,7 +898,7 @@ def _in_hue_range(H, lo, hi):
     return (H >= lo) & (H <= hi) if hi >= lo else ((H >= lo) | (H <= hi))
 
 def _morph_open_close_torch(mask_in, k: int = 3, device: str = "cpu") -> torch.Tensor:
-    use_cuda = device is not None and str(device).startswith("cuda") and torch.cuda.is_available()
+    use_cuda = device is not None and str(device).startswith("cuda") and _cuda_is_usable()
     dev = torch.device(device) if use_cuda else torch.device("cpu")
 
     if isinstance(mask_in, torch.Tensor):
@@ -835,7 +926,7 @@ def _morph_open_close_torch(mask_in, k: int = 3, device: str = "cpu") -> torch.T
     return closed.squeeze(0).squeeze(0).to(dtype=torch.bool)
 
 def _weak_label_core(img_rgb: np.ndarray, hsvp: HSVParams, left_mask_px: int, device: str = "cpu"):
-    use_cuda = device is not None and str(device).startswith("cuda") and torch.cuda.is_available()
+    use_cuda = device is not None and str(device).startswith("cuda") and _cuda_is_usable()
     dev = torch.device(device) if use_cuda else torch.device("cpu")
 
     arr = torch.as_tensor(img_rgb, dtype=torch.float32, device=dev) / 255.0
@@ -980,7 +1071,7 @@ def get_weak_label_cached(path: str, hsvp: HSVParams, left_mask_px: int = LEFT_M
     # Recompute (allowed only when strict off)
     img = imread_rgb(path)
     device_str = device if device is not None else WEAK_LABEL_DEVICE
-    if device_str != "cpu" and not torch.cuda.is_available():
+    if device_str != "cpu" and not _cuda_is_usable():
         device_str = "cpu"
     m, inten = _weak_label_core(img, hsvp, left_mask_px, device=device_str)
     if store:
@@ -1249,7 +1340,7 @@ class TwoRadarFusionDataset(Dataset):
         assert len(sources) == 2, "Provide exactly two radar sources."
         self.A, self.B = sources
         self.dcfg = dcfg or DataConfig()
-        if self.dcfg.weak_label_device != "cpu" and not torch.cuda.is_available():
+        if self.dcfg.weak_label_device != "cpu" and not _cuda_is_usable():
             self.dcfg.weak_label_device = "cpu"
         self.left_mask_px = int(self.dcfg.left_mask_px)
         self.warp_path = self.dcfg.warp_cache_path or warp_cache_path()
@@ -1330,6 +1421,27 @@ class TwoRadarFusionDataset(Dataset):
         if k:
             tensor = torch.rot90(tensor, k, dims=(-2, -1))
         return tensor
+
+    def _transform_warp_grid(self, warp_grid: torch.Tensor, view) -> torch.Tensor:
+        """Apply the sample augmentation view to the warp grid coordinates."""
+        grid = warp_grid.permute(2, 0, 1)
+        grid = self._apply_view(grid, view)
+        flip_h, flip_v, k = view
+
+        u = grid[0]
+        v = grid[1]
+
+        if flip_h:
+            u = -u
+        if flip_v:
+            v = -v
+
+        rotations = k % 4
+        for _ in range(rotations):
+            u, v = v, -u
+
+        transformed = torch.stack([u, v], dim=0)
+        return transformed.permute(1, 2, 0).contiguous()
 
     def _helper_center(self, H: int, W: int) -> Tuple[float, float]:
         return compute_center_px(H, W, self.left_mask_px, self.center_override_a)
@@ -1418,27 +1530,6 @@ class TwoRadarFusionDataset(Dataset):
             resized = F.interpolate(base, size=target_shape, mode="bilinear", align_corners=False)
             self._warp_cache[key] = resized.squeeze(0).permute(1, 2, 0).contiguous()
         return self._warp_cache[key].unsqueeze(0)
-
-    def _warp_triplet(self, inten_list, av_list, mask_list, target_shape: Tuple[int, int]):
-        grid = self._get_warp_grid(target_shape)
-        def _warp_stack(stack, mode):
-            if not stack:
-                return []
-            stacked = torch.stack(stack, dim=0).unsqueeze(1).to(torch.float32)
-            g = grid.to(stacked.device)
-            if g.shape[0] != stacked.shape[0]:
-                g = g.expand(stacked.shape[0], -1, -1, -1)
-            warped = F.grid_sample(stacked, g, mode=mode, padding_mode="zeros", align_corners=False)
-            return [t.contiguous() for t in warped.squeeze(1)]
-
-        inten_out = _warp_stack(inten_list, mode="bilinear")
-        av_out = _warp_stack(av_list, mode="bilinear")
-        mask_out = None
-        if mask_list is not None:
-            mask_float = [m.to(torch.float32) for m in mask_list]
-            mask_warp = _warp_stack(mask_float, mode="bilinear")
-            mask_out = [m > 0.5 for m in mask_warp]
-        return inten_out, av_out, mask_out
 
     def _pad_to(self, tensor: torch.Tensor, th: int, tw: int, mode: str = "reflect", value: float = 0.0):
         ph = max(0, th - tensor.shape[-2])
@@ -1569,47 +1660,18 @@ class TwoRadarFusionDataset(Dataset):
         base_shape_a = tuple(int(x) for x in (a_base_shape if a_base_shape is not None else (H, W)))
         base_shape_b = tuple(int(x) for x in (b_base_shape if b_base_shape is not None else (H, W)))
         self._ensure_warp_base(base_shape_a, base_shape_b)
-        intenB, avB, maskB_list = self._warp_triplet(intenB, avB, maskB_list, (H, W))
-        if maskB_list:
-            maskB_t = maskB_list[1]
-        if intenB:
-            intenB_t = intenB[1]
+        warp_grid = self._get_warp_grid((H, W)).squeeze(0)
 
-        if self.dcfg.fuse_mode == "mean":
-            availA_t = avA[1]
-            availB_t = avB[1]
-            avail_sum = availA_t + availB_t
-            denom = torch.where(avail_sum > 0, avail_sum, torch.ones_like(avail_sum))
-            y_dbz = (intenA_t * availA_t + intenB_t * availB_t) / denom
-        else:
-            y_dbz = torch.maximum(intenA_t, intenB_t)
-        y_mask = maskA_t.logical_or(maskB_t)
+        maskA_center = maskA_t
+        maskB_center = maskB_t
+        availA_center = avA[1]
+        availB_center = avB[1]
 
         key = (H, W)
         if key not in self._hc_cache:
             center = self._helper_center(H, W)
             self._hc_cache[key] = tuple(torch.from_numpy(arr).to(torch.float32) for arr in helper_channels(H, W, center=center))
         r_norm, cos_t, sin_t = (t.clone() for t in self._hc_cache[key])
-
-        inpaint_mask = torch.zeros((H, W), dtype=torch.bool)
-        if self.do_inpaint and self.inpaint_frac > 0.0:
-            allowed = (~atlas_A).clone()
-            if allowed.shape[1] > self.left_mask_px:
-                allowed[:, :self.left_mask_px] = False
-            else:
-                allowed.zero_()
-            avail_combined = (avA[1] > 0.0) | (avB[1] > 0.0)
-            allowed = allowed.logical_and(avail_combined > 0.0)
-            if allowed.any():
-                noise = torch.rand(allowed.shape, dtype=torch.float32)
-                holes = noise < self.inpaint_frac
-                holes = holes.logical_and(allowed)
-                if holes.any():
-                    intenA[1] = intenA[1].masked_fill(holes, 0.0)
-                    intenB[1] = intenB[1].masked_fill(holes, 0.0)
-                    avA[1] = avA[1].masked_fill(holes, 0.0)
-                    avB[1] = avB[1].masked_fill(holes, 0.0)
-                inpaint_mask = holes
 
         chs = [
             intenA[0], intenA[1], intenA[2],
@@ -1621,40 +1683,54 @@ class TwoRadarFusionDataset(Dataset):
 
         view = self._rand_view()
         chs = [self._apply_view(ch, view) for ch in chs]
-        y_mask = self._apply_view(y_mask, view)
-        y_dbz = self._apply_view(y_dbz, view)
-        inpaint_mask = self._apply_view(inpaint_mask, view)
+        maskA_center = self._apply_view(maskA_center, view)
+        maskB_center = self._apply_view(maskB_center, view)
+        availA_center = self._apply_view(availA_center, view)
+        availB_center = self._apply_view(availB_center, view)
+        warp_grid = self._transform_warp_grid(warp_grid, view)
 
         target_h = max(crop_sz, max(int(ch.shape[0]) for ch in chs))
         target_w = max(crop_sz, max(int(ch.shape[1]) for ch in chs))
         chs = [self._pad_to(ch, target_h, target_w, mode="reflect") for ch in chs]
-        y_mask = self._pad_to(y_mask, target_h, target_w, mode="reflect")
-        y_dbz = self._pad_to(y_dbz, target_h, target_w, mode="reflect")
-        inpaint_mask = self._pad_to(inpaint_mask, target_h, target_w, mode="constant", value=0.0)
+        maskA_center = self._pad_to(maskA_center, target_h, target_w, mode="reflect")
+        maskB_center = self._pad_to(maskB_center, target_h, target_w, mode="reflect")
+        availA_center = self._pad_to(availA_center, target_h, target_w, mode="reflect")
+        availB_center = self._pad_to(availB_center, target_h, target_w, mode="reflect")
+        warp_grid_ch = []
+        for c in range(warp_grid.shape[-1]):
+            warp_grid_ch.append(self._pad_to(warp_grid[..., c], target_h, target_w, mode="replicate"))
 
         crop = crop_sz
-        y0, x0 = self._choose_crop(chs, y_mask, crop)
+        combined_mask = maskA_center.logical_or(maskB_center)
+        y0, x0 = self._choose_crop(chs, combined_mask, crop)
         chs = [ch[y0:y0+crop, x0:x0+crop] for ch in chs]
-        y_mask = y_mask[y0:y0+crop, x0:x0+crop]
-        y_dbz = y_dbz[y0:y0+crop, x0:x0+crop]
-        inpaint_mask = inpaint_mask[y0:y0+crop, x0:x0+crop]
+        maskA_center = maskA_center[y0:y0+crop, x0:x0+crop]
+        maskB_center = maskB_center[y0:y0+crop, x0:x0+crop]
+        availA_center = availA_center[y0:y0+crop, x0:x0+crop]
+        availB_center = availB_center[y0:y0+crop, x0:x0+crop]
+        warp_grid = torch.stack([wg[y0:y0+crop, x0:x0+crop] for wg in warp_grid_ch], dim=-1)
 
         x = torch.stack(chs, dim=0).to(torch.float32)
-        y_mask = y_mask.to(torch.float32).unsqueeze(0)
-        y_dbz = y_dbz.to(torch.float32).unsqueeze(0)
-        inpaint_mask = inpaint_mask.to(torch.float32).unsqueeze(0)
+        maskA_center = maskA_center.to(torch.float32).unsqueeze(0)
+        maskB_center = maskB_center.to(torch.float32).unsqueeze(0)
+        availA_center = availA_center.to(torch.float32).unsqueeze(0)
+        availB_center = availB_center.to(torch.float32).unsqueeze(0)
+        warp_grid = warp_grid.to(torch.float32)
 
-        if torch.cuda.is_available():
-            x = x.pin_memory()
-            y_mask = y_mask.pin_memory()
-            y_dbz = y_dbz.pin_memory()
-            inpaint_mask = inpaint_mask.pin_memory()
+        x = _maybe_pin_memory(x)
+        maskA_center = _maybe_pin_memory(maskA_center)
+        maskB_center = _maybe_pin_memory(maskB_center)
+        availA_center = _maybe_pin_memory(availA_center)
+        availB_center = _maybe_pin_memory(availB_center)
+        warp_grid = _maybe_pin_memory(warp_grid)
 
         return {
             "x": x.contiguous(),
-            "y_mask": y_mask.contiguous(),
-            "y_dbz": y_dbz.contiguous(),
-            "inpaint_mask": inpaint_mask.contiguous(),
+            "maskA_t": maskA_center.contiguous(),
+            "maskB_t": maskB_center.contiguous(),
+            "availA_t": availA_center.contiguous(),
+            "availB_t": availB_center.contiguous(),
+            "warp_grid": warp_grid.contiguous(),
         }
 
 # ===========================
@@ -1762,7 +1838,7 @@ class EMA:
 # AMP & compile gate
 # ===========================
 def allow_compile():
-    if not torch.cuda.is_available(): return False
+    if not _cuda_is_usable(): return False
     major, minor = torch.cuda.get_device_capability()
     return major >= 8  # Ampere+/Ada (L4 OK)
 
@@ -1773,7 +1849,7 @@ def _gb(bytes_):
     return bytes_ / (1024**3)
 
 def _cuda_mem():
-    if not torch.cuda.is_available():
+    if not _cuda_is_usable():
         return 0.0, 0.0, 0.0
     alloc = torch.cuda.memory_allocated()
     reserv = torch.cuda.memory_reserved()
@@ -1797,7 +1873,8 @@ def _make_bar(loader, desc, rank):
 # ===========================
 def lr_range_test(model, train_loader, device, loss_focal, steps=LR_FINDER_STEPS, lr_min=LR_MIN, lr_max=LR_MAX,
                   AMP_ENABLED=False, amp_dtype=None, amp_ctx=contextlib.nullcontext, scaler=None, pin=False,
-                  time_limit=LR_FINDER_TIME_LIMIT_SEC, dice_weight=DICE_WEIGHT, lambda_dbz=LAMBDA_DBZ):
+                  time_limit=LR_FINDER_TIME_LIMIT_SEC, dice_weight=DICE_WEIGHT, lambda_dbz=LAMBDA_DBZ,
+                  fuse_mode=FUSE_MODE):
     model.train()
     tmp_opt = torch.optim.AdamW(model.parameters(), lr=lr_min, weight_decay=WEIGHT_DECAY)
     num = min(int(steps), int(LR_FINDER_MAX_STEPS))
@@ -1807,14 +1884,78 @@ def lr_range_test(model, train_loader, device, loss_focal, steps=LR_FINDER_STEPS
     for batch in train_loader:
         iters += 1
         if iters > num or (time.time() - t0) > float(time_limit): break
-        x = batch["x"].to(device, non_blocking=pin).contiguous(memory_format=torch.channels_last)
-        y_mask = batch["y_mask"].to(device, non_blocking=pin)
-        y_dbz = batch["y_dbz"].to(device, non_blocking=pin)
+        x_unwarped = batch["x"].to(device, non_blocking=pin)
+        warp_grid_gpu = batch["warp_grid"].to(device, non_blocking=pin)
+        warp_grid_gpu = warp_grid_gpu.to(x_unwarped.dtype)
+        maskA_t = batch["maskA_t"].to(device, non_blocking=pin).to(x_unwarped.dtype)
+        maskB_t = batch["maskB_t"].to(device, non_blocking=pin).to(x_unwarped.dtype)
+        availA_t = batch["availA_t"].to(device, non_blocking=pin).to(x_unwarped.dtype)
+        availB_t = batch["availB_t"].to(device, non_blocking=pin).to(x_unwarped.dtype)
+
+        def _warp_on_device(tensor_stack: torch.Tensor) -> torch.Tensor:
+            return F.grid_sample(
+                tensor_stack,
+                warp_grid_gpu,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=False,
+            )
+
+        intenA = x_unwarped[:, 0:3, :, :]
+        intenB_unwarped = x_unwarped[:, 3:6, :, :]
+        avA = x_unwarped[:, 6:9, :, :]
+        avB_unwarped = x_unwarped[:, 9:12, :, :]
+        helpers = x_unwarped[:, 12:15, :, :]
+
+        radarB_unwarped = torch.cat(
+            [intenB_unwarped, avB_unwarped, maskB_t, availB_t], dim=1
+        ).contiguous()
+        radarB_warped = _warp_on_device(radarB_unwarped)
+        split_sizes = [
+            intenB_unwarped.size(1),
+            avB_unwarped.size(1),
+            maskB_t.size(1),
+            availB_t.size(1),
+        ]
+        intenB, avB, maskB_warp, availB_warp = torch.split(
+            radarB_warped, split_sizes, dim=1
+        )
+        intenB = intenB.contiguous()
+        avB = avB.contiguous()
+        maskB_warp = torch.clamp(maskB_warp.contiguous(), 0.0, 1.0)
+        availB_warp = torch.clamp(availB_warp.contiguous(), 0.0, 1.0)
+        maskA_t = torch.clamp(maskA_t, 0.0, 1.0)
+        availA_t = torch.clamp(availA_t, 0.0, 1.0)
+
+        x = torch.cat([intenA, intenB, avA, avB, helpers], dim=1).contiguous()
+        x = x.to(device, non_blocking=pin).contiguous(memory_format=torch.channels_last)
+
+        intenA_center = intenA[:, 1:2, :, :]
+        intenB_center = intenB[:, 1:2, :, :]
+        availA_center = availA_t
+        availB_center = availB_warp
+        maskA_bin = (maskA_t > 0.5).float()
+        maskB_bin = (maskB_warp > 0.5).float()
+        y_mask_raw = torch.maximum(maskA_bin, maskB_bin)
+        y_mask = y_mask_raw if LABEL_SMOOTH_EPS <= 0 else y_mask_raw * (1.0 - LABEL_SMOOTH_EPS) + 0.5 * LABEL_SMOOTH_EPS
+
+        availA_mask = (availA_center > 0.0).float()
+        availB_mask = (availB_center > 0.0).float()
+        combined_avail_mask = torch.maximum(availA_mask, availB_mask)
+        if fuse_mode == "mean":
+            avail_sum = availA_center + availB_center
+            denom = torch.where(avail_sum > 0, avail_sum, torch.ones_like(avail_sum))
+            y_dbz = (intenA_center * availA_center + intenB_center * availB_center) / denom
+        else:
+            intenA_masked = intenA_center * availA_mask
+            intenB_masked = intenB_center * availB_mask
+            y_dbz = torch.maximum(intenA_masked, intenB_masked)
+        y_dbz = y_dbz * combined_avail_mask
         tmp_opt.zero_grad(set_to_none=True)
         with amp_ctx():
             logits, dbz_pred = model(x)
             loss_mask = loss_focal(logits, y_mask) + dice_weight * dice_loss(logits, y_mask)
-            gate = (y_mask > 0.5).float()
+            gate = (y_mask_raw > 0.5).float()
             l1_all = F.smooth_l1_loss(dbz_pred, y_dbz, reduction="none")
             pos = gate.sum()
             loss_dbz = (l1_all * gate).sum() / (pos + 1e-6)
@@ -1849,8 +1990,8 @@ def _predict_tta(model, x, do_tta: bool):
 
 def bcast_float_from0(val: float) -> float:
     if not ddp_is_dist(): return val
-    if torch.cuda.is_available():
-        device = torch.device("cuda", torch.cuda.current_device())
+    if _cuda_is_usable():
+        device = torch.device("cuda")
     else:
         device = torch.device("cpu")
     t = torch.tensor([val], device=device)
@@ -1882,10 +2023,17 @@ def build_sources(rank=0):
         print("⚠️  Could not infer radar ordering from folder names; using provided order.", flush=True)
     return sources
 
+def _seed_worker(worker_id: int, base_seed: int, rank: int) -> None:
+    seed = base_seed + worker_id + rank * 1000
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+
 def make_loaders(sources, device, rank, world_size, num_workers, prefetch_factor,
                  warp_path: Optional[str] = None, do_inpaint: bool = False, inpaint_frac: float = 0.0):
     weak_dev = WEAK_LABEL_DEVICE
-    if weak_dev != "cpu" and not torch.cuda.is_available():
+    if weak_dev != "cpu" and not _cuda_is_usable():
         weak_dev = "cpu"
     common_cfg = dict(
         weak_label_device=weak_dev,
@@ -1905,22 +2053,18 @@ def make_loaders(sources, device, rank, world_size, num_workers, prefetch_factor
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False) if ddp_is_dist() else None
     val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=rank, shuffle=False, drop_last=False) if ddp_is_dist() else None
 
-    def _wif(worker_id):
-        seed = SEED + worker_id + rank*1000
-        np.random.seed(seed)
-        random.seed(seed)
-        torch.manual_seed(seed)
-
     g = torch.Generator(); g.manual_seed(SEED + rank)
     pin = (device.type == "cuda")
+    worker_init = partial(_seed_worker, base_seed=SEED, rank=rank)
 
     def mk(ds, bs, shuffle, sampler):
         kwargs = dict(dataset=ds, batch_size=bs, shuffle=shuffle, sampler=sampler,
-                      num_workers=num_workers, pin_memory=pin, worker_init_fn=_wif,
+                      num_workers=num_workers, pin_memory=pin, worker_init_fn=worker_init,
                       generator=g, drop_last=False)
         if num_workers > 0:
             kwargs["persistent_workers"] = PERSISTENT_WORKERS
             kwargs["prefetch_factor"] = prefetch_factor
+            kwargs["multiprocessing_context"] = "spawn"
         return DataLoader(**kwargs)
 
     train_loader = mk(train_ds, BATCH_SIZE, shuffle=(train_sampler is None), sampler=train_sampler)
@@ -1963,12 +2107,60 @@ def _update_swa_bn_stats(train_ds, device, swa_model, batch_size, rank):
             def __init__(self, base_loader, device):
                 self.base_loader = base_loader
                 self.device = device
+                ds = getattr(base_loader, "dataset", None)
+                dcfg_local = getattr(ds, "dcfg", None)
+                self.do_inpaint = bool(getattr(dcfg_local, "do_inpaint", False))
+                self.inpaint_frac = float(getattr(dcfg_local, "inpaint_frac", 0.0))
+                self.left_mask_px = int(getattr(ds, "left_mask_px", LEFT_MASK_PX))
 
             def __iter__(self):
                 non_blocking = (self.device.type == "cuda")
                 for batch in self.base_loader:
-                    x = batch["x"].to(self.device, non_blocking=non_blocking)
-                    yield x.contiguous(memory_format=torch.channels_last)
+                    x_unwarped = batch["x"].to(self.device, non_blocking=non_blocking)
+                    warp_grid = batch["warp_grid"].to(self.device, non_blocking=non_blocking)
+                    warp_grid = warp_grid.to(x_unwarped.dtype)
+
+                    def _warp_on_device(tensor_stack: torch.Tensor) -> torch.Tensor:
+                        return F.grid_sample(
+                            tensor_stack,
+                            warp_grid,
+                            mode="bilinear",
+                            padding_mode="zeros",
+                            align_corners=False,
+                        )
+
+                    intenA = x_unwarped[:, 0:3, :, :]
+                    intenB_unwarped = x_unwarped[:, 3:6, :, :]
+                    avA = x_unwarped[:, 6:9, :, :]
+                    avB_unwarped = x_unwarped[:, 9:12, :, :]
+                    helpers = x_unwarped[:, 12:15, :, :]
+
+                    radarB_unwarped = torch.cat([intenB_unwarped, avB_unwarped], dim=1).contiguous()
+                    radarB_warped = _warp_on_device(radarB_unwarped)
+                    intenB, avB = torch.split(
+                        radarB_warped,
+                        [intenB_unwarped.size(1), avB_unwarped.size(1)],
+                        dim=1,
+                    )
+                    intenB = intenB.contiguous()
+                    avB = avB.contiguous()
+
+                    availA_center = avA[:, 1:2, :, :]
+                    availB_center = avB[:, 1:2, :, :]
+                    _apply_inpaint_on_device(
+                        intenA,
+                        intenB,
+                        avA,
+                        avB,
+                        availA_center,
+                        availB_center,
+                        self.do_inpaint,
+                        self.inpaint_frac,
+                        self.left_mask_px,
+                    )
+
+                    x = torch.cat([intenA, intenB, avA, avB, helpers], dim=1).contiguous()
+                    yield x.to(memory_format=torch.channels_last)
 
             def __len__(self):
                 return len(self.base_loader)
@@ -2001,6 +2193,7 @@ def run_training(hparams, device, rank, local_rank, world_size,
     focal_gamma = hparams.get("focal_gamma", 2.0)
     dice_w = hparams.get("dice_weight", DICE_WEIGHT)
     use_swa = hparams.get("use_swa", (USE_SWA and scheduler_kind == "cosine"))
+    fuse_mode = getattr(dcfg, "fuse_mode", FUSE_MODE)
     grad_accum = max(1, hparams.get("grad_accum_steps", GRAD_ACCUM_STEPS))
     inpaint_weight = max(0.0, hparams.get("inpaint_weight", 0.0))
 
@@ -2039,7 +2232,7 @@ def run_training(hparams, device, rank, local_rank, world_size,
                                     lr_max=hparams.get("lr_max", LR_MAX),
                                     AMP_ENABLED=AMP_ENABLED, amp_ctx=amp_ctx, scaler=scaler, pin=False,
                                     time_limit=LR_FINDER_TIME_LIMIT_SEC, dice_weight=dice_w,
-                                    lambda_dbz=lambda_dbz)
+                                    lambda_dbz=lambda_dbz, fuse_mode=fuse_mode)
             del model_copy; gc.collect()
             if device.type == "cuda": torch.cuda.empty_cache()
         else:
@@ -2059,6 +2252,16 @@ def run_training(hparams, device, rank, local_rank, world_size,
     sched = None
     swa_model = None
     swa_sched = None
+
+    def _extract_inpaint_cfg(cfg_like) -> Tuple[bool, float, int]:
+        return (
+            bool(getattr(cfg_like, "do_inpaint", False)),
+            float(getattr(cfg_like, "inpaint_frac", 0.0)),
+            int(getattr(cfg_like, "left_mask_px", LEFT_MASK_PX)),
+        )
+
+    train_cfg_inpaint = _extract_inpaint_cfg(getattr(train_ds, "dcfg", dcfg))
+    val_cfg_inpaint = _extract_inpaint_cfg(getattr(val_ds, "dcfg", dcfg)) if val_ds is not None else (False, 0.0, LEFT_MASK_PX)
 
     if scheduler_kind == "onecycle":
         max_lr = init_lr
@@ -2127,13 +2330,86 @@ def run_training(hparams, device, rank, local_rank, world_size,
 
         for step, batch in enumerate(bar, 1):
             iter_t0 = time.time()
-            x = batch["x"].to(device, non_blocking=(device.type=="cuda")).contiguous(memory_format=torch.channels_last)
-            y_mask_raw = batch["y_mask"].to(device, non_blocking=(device.type=="cuda"))
-            y_mask = y_mask_raw if LABEL_SMOOTH_EPS <= 0 else y_mask_raw*(1.0 - LABEL_SMOOTH_EPS) + 0.5*LABEL_SMOOTH_EPS
-            y_dbz = batch["y_dbz"].to(device, non_blocking=(device.type=="cuda"))
-            inpaint_mask = batch.get("inpaint_mask")
-            if inpaint_mask is not None:
-                inpaint_mask = inpaint_mask.to(device, non_blocking=(device.type=="cuda"))
+            pin = (device.type == "cuda")
+            x_unwarped = batch["x"].to(device, non_blocking=pin)
+            warp_grid_gpu = batch["warp_grid"].to(device, non_blocking=pin)
+            warp_grid_gpu = warp_grid_gpu.to(x_unwarped.dtype)
+            maskA_t = batch["maskA_t"].to(device, non_blocking=pin).to(x_unwarped.dtype)
+            maskB_t = batch["maskB_t"].to(device, non_blocking=pin).to(x_unwarped.dtype)
+            availA_t = batch["availA_t"].to(device, non_blocking=pin).to(x_unwarped.dtype)
+            availB_t = batch["availB_t"].to(device, non_blocking=pin).to(x_unwarped.dtype)
+            def _warp_on_device(tensor_stack: torch.Tensor) -> torch.Tensor:
+                return F.grid_sample(
+                    tensor_stack,
+                    warp_grid_gpu,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=False,
+                )
+
+            intenA = x_unwarped[:, 0:3, :, :]
+            intenB_unwarped = x_unwarped[:, 3:6, :, :]
+            avA = x_unwarped[:, 6:9, :, :]
+            avB_unwarped = x_unwarped[:, 9:12, :, :]
+            helpers = x_unwarped[:, 12:15, :, :]
+
+            radarB_unwarped = torch.cat(
+                [intenB_unwarped, avB_unwarped, maskB_t, availB_t], dim=1
+            ).contiguous()
+            radarB_warped = _warp_on_device(radarB_unwarped)
+            split_sizes = [
+                intenB_unwarped.size(1),
+                avB_unwarped.size(1),
+                maskB_t.size(1),
+                availB_t.size(1),
+            ]
+            intenB, avB, maskB_warp, availB_warp = torch.split(
+                radarB_warped, split_sizes, dim=1
+            )
+            intenB = intenB.contiguous()
+            avB = avB.contiguous()
+            maskB_warp = torch.clamp(maskB_warp.contiguous(), 0.0, 1.0)
+            availB_warp = torch.clamp(availB_warp.contiguous(), 0.0, 1.0)
+            maskA_t = torch.clamp(maskA_t, 0.0, 1.0)
+            availA_t = torch.clamp(availA_t, 0.0, 1.0)
+
+            availA_center = availA_t
+            availB_center = availB_warp
+
+            inpaint_mask = _apply_inpaint_on_device(
+                intenA,
+                intenB,
+                avA,
+                avB,
+                availA_center,
+                availB_center,
+                *train_cfg_inpaint,
+            )
+
+            x = torch.cat([intenA, intenB, avA, avB, helpers], dim=1).contiguous()
+            x = x.to(memory_format=torch.channels_last)
+
+            intenA_center = intenA[:, 1:2, :, :]
+            intenB_center = intenB[:, 1:2, :, :]
+
+            maskA_bin = (maskA_t > 0.5).float()
+            maskB_bin = (maskB_warp > 0.5).float()
+            y_mask_raw = torch.maximum(maskA_bin, maskB_bin)
+            y_mask = y_mask_raw if LABEL_SMOOTH_EPS <= 0 else y_mask_raw * (1.0 - LABEL_SMOOTH_EPS) + 0.5 * LABEL_SMOOTH_EPS
+
+            availA_mask = (availA_center > 0.0).float()
+            availB_mask = (availB_center > 0.0).float()
+            combined_avail_mask = torch.maximum(availA_mask, availB_mask)
+
+            if fuse_mode == "mean":
+                avail_sum = availA_center + availB_center
+                denom = torch.where(avail_sum > 0, avail_sum, torch.ones_like(avail_sum))
+                y_dbz = (intenA_center * availA_center + intenB_center * availB_center) / denom
+            else:
+                intenA_masked = intenA_center * availA_mask
+                intenB_masked = intenB_center * availB_mask
+                y_dbz = torch.maximum(intenA_masked, intenB_masked)
+            y_dbz = y_dbz * combined_avail_mask
 
             loss_inpaint = torch.zeros((), device=device)
             with (torch.amp.autocast("cuda", dtype=(torch.bfloat16 if (device.type=="cuda" and torch.cuda.is_bf16_supported()) else torch.float16), enabled=(device.type=="cuda" and MIXED_PRECISION)) if device.type=="cuda" else contextlib.nullcontext()):
@@ -2206,13 +2482,86 @@ def run_training(hparams, device, rank, local_rank, world_size,
             with torch.no_grad():
                 for batch in barv:
                     iter_t0 = time.time()
-                    x = batch["x"].to(device, non_blocking=(device.type=="cuda")).contiguous(memory_format=torch.channels_last)
-                    y_mask_raw = batch["y_mask"].to(device, non_blocking=(device.type=="cuda"))
-                    y_mask = y_mask_raw if LABEL_SMOOTH_EPS <= 0 else y_mask_raw*(1.0 - LABEL_SMOOTH_EPS) + 0.5*LABEL_SMOOTH_EPS
-                    y_dbz = batch["y_dbz"].to(device, non_blocking=(device.type=="cuda"))
-                    inpaint_mask = batch.get("inpaint_mask")
-                    if inpaint_mask is not None:
-                        inpaint_mask = inpaint_mask.to(device, non_blocking=(device.type=="cuda"))
+                    pin = (device.type == "cuda")
+                    x_unwarped = batch["x"].to(device, non_blocking=pin)
+                    warp_grid_gpu = batch["warp_grid"].to(device, non_blocking=pin)
+                    warp_grid_gpu = warp_grid_gpu.to(x_unwarped.dtype)
+                    maskA_t = batch["maskA_t"].to(device, non_blocking=pin).to(x_unwarped.dtype)
+                    maskB_t = batch["maskB_t"].to(device, non_blocking=pin).to(x_unwarped.dtype)
+                    availA_t = batch["availA_t"].to(device, non_blocking=pin).to(x_unwarped.dtype)
+                    availB_t = batch["availB_t"].to(device, non_blocking=pin).to(x_unwarped.dtype)
+                    def _warp_on_device(tensor_stack: torch.Tensor) -> torch.Tensor:
+                        return F.grid_sample(
+                            tensor_stack,
+                            warp_grid_gpu,
+                            mode="bilinear",
+                            padding_mode="zeros",
+                            align_corners=False,
+                        )
+
+                    intenA = x_unwarped[:, 0:3, :, :]
+                    intenB_unwarped = x_unwarped[:, 3:6, :, :]
+                    avA = x_unwarped[:, 6:9, :, :]
+                    avB_unwarped = x_unwarped[:, 9:12, :, :]
+                    helpers = x_unwarped[:, 12:15, :, :]
+
+                    radarB_unwarped = torch.cat(
+                        [intenB_unwarped, avB_unwarped, maskB_t, availB_t], dim=1
+                    ).contiguous()
+                    radarB_warped = _warp_on_device(radarB_unwarped)
+                    split_sizes = [
+                        intenB_unwarped.size(1),
+                        avB_unwarped.size(1),
+                        maskB_t.size(1),
+                        availB_t.size(1),
+                    ]
+                    intenB, avB, maskB_warp, availB_warp = torch.split(
+                        radarB_warped, split_sizes, dim=1
+                    )
+                    intenB = intenB.contiguous()
+                    avB = avB.contiguous()
+                    maskB_warp = torch.clamp(maskB_warp.contiguous(), 0.0, 1.0)
+                    availB_warp = torch.clamp(availB_warp.contiguous(), 0.0, 1.0)
+                    maskA_t = torch.clamp(maskA_t, 0.0, 1.0)
+                    availA_t = torch.clamp(availA_t, 0.0, 1.0)
+
+                    availA_center = availA_t
+                    availB_center = availB_warp
+
+                    inpaint_mask = _apply_inpaint_on_device(
+                        intenA,
+                        intenB,
+                        avA,
+                        avB,
+                        availA_center,
+                        availB_center,
+                        *val_cfg_inpaint,
+                    )
+
+                    x = torch.cat([intenA, intenB, avA, avB, helpers], dim=1).contiguous()
+                    x = x.to(memory_format=torch.channels_last)
+
+                    intenA_center = intenA[:, 1:2, :, :]
+                    intenB_center = intenB[:, 1:2, :, :]
+
+                    maskA_bin = (maskA_t > 0.5).float()
+                    maskB_bin = (maskB_warp > 0.5).float()
+                    y_mask_raw = torch.maximum(maskA_bin, maskB_bin)
+                    y_mask = y_mask_raw if LABEL_SMOOTH_EPS <= 0 else y_mask_raw * (1.0 - LABEL_SMOOTH_EPS) + 0.5 * LABEL_SMOOTH_EPS
+
+                    availA_mask = (availA_center > 0.0).float()
+                    availB_mask = (availB_center > 0.0).float()
+                    combined_avail_mask = torch.maximum(availA_mask, availB_mask)
+
+                    if fuse_mode == "mean":
+                        avail_sum = availA_center + availB_center
+                        denom = torch.where(avail_sum > 0, avail_sum, torch.ones_like(avail_sum))
+                        y_dbz = (intenA_center * availA_center + intenB_center * availB_center) / denom
+                    else:
+                        intenA_masked = intenA_center * availA_mask
+                        intenB_masked = intenB_center * availB_mask
+                        y_dbz = torch.maximum(intenA_masked, intenB_masked)
+                    y_dbz = y_dbz * combined_avail_mask
                     if device.type == "cuda":
                         with torch.amp.autocast("cuda", dtype=(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16), enabled=MIXED_PRECISION):
                             logits, dbz_pred = _predict_tta(m, x, do_tta=do_tta)
@@ -2522,7 +2871,7 @@ def stage_gpu_train(args):
     STRICT_ATLAS_ONLY = bool(args.strict_atlas_only)
 
     world_size, rank, local_rank = ddp_setup()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if _cuda_is_usable() else "cpu")
     if is_main(rank):
         print("DDP:", dict(world_size=world_size, rank=rank, local_rank=local_rank), flush=True)
 
@@ -2584,7 +2933,7 @@ def stage_gpu_train(args):
 
     ddp_cleanup()
     gc.collect()
-    if torch.cuda.is_available():
+    if _cuda_is_usable():
         torch.cuda.empty_cache()
 
 # ===========================
@@ -2642,6 +2991,7 @@ def parse_args():
     return p.parse_args()
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     args = parse_args()
     if getattr(args, "weak_cache_write_files", False):
         WEAK_CACHE_WRITE_FILES = True
