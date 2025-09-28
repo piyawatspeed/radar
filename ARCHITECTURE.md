@@ -19,7 +19,7 @@
 
 ## Dataset Pipeline
 - `SourceData` encapsulates per-radar metadata, including sorted timestamp indices, atlas masks, and maps from timestamps to file paths.【F:ddp.py†L1170-L1239】
-- `TwoRadarFusionDataset` gathers temporal triplets for both radars, fuses weak-label masks and intensities, performs atlas gating, aligns Radar B via the cached warp, augments with helper channels, and prepares optional inpaint masks before padding/cropping for batching.【F:ddp.py†L1230-L1668】
+- `TwoRadarFusionDataset` gathers temporal triplets for both radars, retains the per-radar central masks and availability slices after augmentation, aligns Radar B via the cached warp, augments with helper channels, and prepares optional inpaint masks before padding/cropping for batching.【F:ddp.py†L1230-L1668】
 - Loader construction (`make_loaders`) builds deterministic train/validation splits, sets up `DistributedSampler` instances when running under DDP, and forwards user-tunable DataLoader parameters such as worker count and prefetch depth.【F:ddp.py†L1869-L1947】
 
 ## Model Definition
