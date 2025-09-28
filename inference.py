@@ -4,13 +4,14 @@ This utility mirrors the preprocessing steps used during training so that
 predictions can be generated from raw radar RGB frames.  It assembles the
 15-channel input tensor (6 intensity channels, 6 availability channels, and
 3 helper channels) for a target timestamp, runs the trained TinyUNet model,
-and optionally saves the probability mask and cleaned reflectivity maps.
+and optionally saves the probability mask, cleaned reflectivity maps,
+georeferencing grids, assembled network inputs, and a JSON metadata summary.
 """
 from __future__ import annotations
 
 import argparse
 import bisect
-from collections import OrderedDict
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -19,6 +20,8 @@ from PIL import Image
 
 import torch
 import torch.nn.functional as F
+
+from pyproj import Transformer
 
 import ddp as training_cfg
 
@@ -36,6 +39,7 @@ from ddp import (
     compute_center_px,
     compute_mpp,
     helper_channels,
+    _fit_mask_to,
     list_images,
     warp_cache_path,
     _parse_center_tuple,
@@ -141,6 +145,22 @@ class TimestampIndex:
             tol = max(MIN_TOL_MINUTES, int(tol_base * TOL_FRAC))
             ts_match = self.find_within(seek_ts, tol)
             paths.append(self.ts_to_path.get(ts_match) if ts_match is not None else None)
+        return paths
+
+    def strict_triplet(self, target_ts: int, neighbor_minutes: int) -> Optional[List[str]]:
+        """Return exact-offset triplet paths when every frame is present."""
+
+        if neighbor_minutes <= 0:
+            raise ValueError("neighbor_minutes must be positive for strict alignment.")
+
+        offsets = (-neighbor_minutes, 0, neighbor_minutes)
+        paths: List[str] = []
+        for offset in offsets:
+            seek_ts = add_minutes(target_ts, offset)
+            path = self.ts_to_path.get(seek_ts)
+            if path is None:
+                return None
+            paths.append(path)
         return paths
 
 
@@ -262,56 +282,109 @@ def _infer_image_shape(
     raise RuntimeError("Unable to determine image dimensions from provided paths.")
 
 
-def _load_atlas(atlas_path: Optional[str], expected_shape: Tuple[int, int]) -> Optional[np.ndarray]:
+def _load_atlas(atlas_path: Optional[str]) -> Optional[np.ndarray]:
     if not atlas_path:
         return None
-    atlas = _load_bool_mask_npz(atlas_path)
-    if atlas.shape != expected_shape:
-        raise ValueError(
-            f"Atlas at '{atlas_path}' has shape {atlas.shape}, expected {expected_shape}."
-        )
-    return atlas
+    return _load_bool_mask_npz(atlas_path)
+
+
+def _pad_tensor(
+    tensor: torch.Tensor,
+    target_shape: Tuple[int, int],
+    *,
+    mode: str = "reflect",
+    value: float = 0.0,
+) -> torch.Tensor:
+    """Pad *tensor* to *target_shape* mirroring training-time behavior."""
+
+    target_h, target_w = map(int, target_shape)
+    h, w = int(tensor.shape[-2]), int(tensor.shape[-1])
+    pad_h = max(0, target_h - h)
+    pad_w = max(0, target_w - w)
+    if pad_h == 0 and pad_w == 0:
+        return tensor
+
+    pad_mode = mode
+    if pad_mode == "reflect" and (h <= 1 or w <= 1):
+        pad_mode = "replicate"
+
+    needs_threshold = tensor.dtype == torch.bool and pad_mode != "constant"
+    work = tensor.to(torch.float32) if needs_threshold else tensor
+    pad = (0, pad_w, 0, pad_h)
+    work = work.unsqueeze(0).unsqueeze(0)
+    if pad_mode == "constant":
+        work = F.pad(work, pad, mode="constant", value=float(value))
+    else:
+        work = F.pad(work, pad, mode=pad_mode)
+    work = work.squeeze(0).squeeze(0)
+    if needs_threshold:
+        work = work > 0.5
+    return work
 
 
 def _process_radar_source(
     paths: Sequence[Optional[str]],
     atlas: Optional[np.ndarray],
-    image_shape: Tuple[int, int],
     hsvp: HSVParams,
     left_mask_px: int,
     device: torch.device,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    height, width = image_shape
+) -> Tuple[List[torch.Tensor], List[torch.Tensor], Tuple[int, int], Optional[Tuple[int, int]], Optional[np.ndarray]]:
+    entries: List[Optional[torch.Tensor]] = []
+    shapes: List[Tuple[int, int]] = []
+    base_shape: Optional[Tuple[int, int]] = None
+
+    for path in paths:
+        if path is None:
+            entries.append(None)
+            continue
+        img_rgb = _ensure_rgb(path)
+        _, inten_np = _weak_label_core(img_rgb, hsvp, left_mask_px, device=str(device))
+        intensity = torch.from_numpy(inten_np).to(device=device, dtype=torch.float32)
+        shape = (int(intensity.shape[0]), int(intensity.shape[1]))
+        shapes.append(shape)
+        if base_shape is None:
+            base_shape = shape
+        entries.append(intensity)
+
+    if shapes:
+        target_h = max(h for h, _ in shapes)
+        target_w = max(w for _, w in shapes)
+    elif atlas is not None:
+        target_h, target_w = map(int, atlas.shape[:2])
+    else:
+        raise RuntimeError("No frames available to infer radar input shape.")
+
+    target_shape = (int(target_h), int(target_w))
+
+    atlas_fit: Optional[np.ndarray] = None
     atlas_torch: Optional[torch.Tensor] = None
     if atlas is not None:
-        atlas_torch = torch.from_numpy(atlas.astype(np.bool_)).to(device)
+        atlas_fit = _fit_mask_to(target_shape[0], target_shape[1], atlas)
+        atlas_bool = np.asarray(atlas_fit, dtype=np.bool_)
+        atlas_torch = torch.from_numpy(atlas_bool).to(device)
 
     intensity_channels: List[torch.Tensor] = []
     availability_channels: List[torch.Tensor] = []
 
-    for path in paths:
-        if path is None:
-            intensity = torch.zeros((height, width), dtype=torch.float32, device=device)
-            availability = torch.zeros((height, width), dtype=torch.float32, device=device)
+    for entry in entries:
+        if entry is None:
+            intensity = torch.zeros(target_shape, dtype=torch.float32, device=device)
+            availability = torch.zeros(target_shape, dtype=torch.float32, device=device)
         else:
-            img_rgb = _ensure_rgb(path)
-            _, inten_np = _weak_label_core(img_rgb, hsvp, left_mask_px, device=str(device))
-            intensity = torch.from_numpy(inten_np).to(device=device, dtype=torch.float32)
-            if intensity.shape != (height, width):
-                raise ValueError(
-                    f"Intensity shape {intensity.shape} from '{path}' does not match expected {(height, width)}."
-                )
+            intensity = entry
+            if intensity.shape != target_shape:
+                intensity = _pad_tensor(intensity, target_shape, mode="replicate")
             if atlas_torch is not None:
                 intensity = intensity.clone()
                 intensity.masked_fill_(atlas_torch, 0.0)
-            availability = torch.ones((height, width), dtype=torch.float32, device=device)
+            availability = torch.ones(target_shape, dtype=torch.float32, device=device)
             if atlas_torch is not None:
                 availability = availability.clone()
                 availability.masked_fill_(atlas_torch, 0.0)
         intensity_channels.append(intensity)
         availability_channels.append(availability)
 
-    return intensity_channels, availability_channels
+    return intensity_channels, availability_channels, target_shape, base_shape, atlas_fit
 
 
 def _compute_warp_meta(
@@ -341,6 +414,44 @@ def _compute_warp_meta(
     }
 
 
+def _build_georef_grid(
+    shape: Tuple[int, int],
+    left_mask_px: int,
+    radar_latlon: Tuple[float, float],
+    radar_range_km: float,
+    center_override: Optional[Tuple[float, float]] = None,
+    *,
+    dtype: np.dtype = np.float32,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Generate latitude/longitude grids for Radar A pixels."""
+
+    height, width = map(int, shape)
+    cx, cy = compute_center_px(height, width, left_mask_px, center_override)
+    mpp = compute_mpp(height, width, left_mask_px, radar_range_km)
+
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    x_m = (xx - cx).astype(np.float32) * mpp
+    y_m = (cy - yy).astype(np.float32) * mpp
+
+    proj = Transformer.from_crs(
+        f"+proj=aeqd +lat_0={radar_latlon[0]} +lon_0={radar_latlon[1]} +datum=WGS84",
+        "EPSG:4326",
+        always_xy=True,
+    )
+    lon, lat = proj.transform(x_m, y_m)
+
+    return lat.astype(dtype, copy=False), lon.astype(dtype, copy=False)
+
+
+def _normalize_warp_cache_path(path: str) -> Path:
+    """Ensure the warp cache uses an .npy suffix so load/save agree."""
+
+    path_obj = Path(path)
+    if path_obj.suffix.lower() != ".npy":
+        path_obj = Path(f"{path_obj}.npy")
+    return path_obj
+
+
 def _load_or_build_warp_grid(
     shape_a: Tuple[int, int],
     shape_b: Tuple[int, int],
@@ -352,7 +463,7 @@ def _load_or_build_warp_grid(
     radar_b_range_km: float,
     center_override_a: Optional[Tuple[float, float]] = None,
     center_override_b: Optional[Tuple[float, float]] = None,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
+) -> Tuple[torch.Tensor, Dict[str, float], Dict[str, Any]]:
     shape_a = tuple(map(int, shape_a))
     shape_b = tuple(map(int, shape_b))
     meta = _compute_warp_meta(
@@ -367,10 +478,11 @@ def _load_or_build_warp_grid(
 
     grid_np: Optional[np.ndarray] = None
     path_obj: Optional[Path] = None
+    cache_hit = False
     if warp_path:
-        path_obj = Path(warp_path)
+        path_obj = _normalize_warp_cache_path(warp_path)
         if path_obj.is_file():
-            arr = np.load(path_obj)
+            arr = np.load(path_obj, allow_pickle=False)
             grid_np = np.asarray(arr, dtype=np.float32)
             if grid_np.ndim != 3 or grid_np.shape[2] != 2:
                 grid_np = None
@@ -393,6 +505,7 @@ def _load_or_build_warp_grid(
                     pass
             else:
                 grid_np = grid_np.astype(np.float32, copy=False)
+                cache_hit = True
 
     if grid_np is None:
         grid_np, _ = build_warp_grid(
@@ -407,7 +520,7 @@ def _load_or_build_warp_grid(
             center_override_b=center_override_b,
         )
         if path_obj is None and warp_path:
-            path_obj = Path(warp_path)
+            path_obj = _normalize_warp_cache_path(warp_path)
         if path_obj is not None:
             try:
                 path_obj.parent.mkdir(parents=True, exist_ok=True)
@@ -415,8 +528,26 @@ def _load_or_build_warp_grid(
             except Exception:
                 pass
 
+    warp_info = {
+        "path": str(path_obj) if path_obj is not None else None,
+        "cache_hit": bool(cache_hit),
+    }
     grid_torch = torch.from_numpy(np.asarray(grid_np, dtype=np.float32))
-    return grid_torch, meta
+    return grid_torch, meta, warp_info
+
+
+def _resize_warp_grid(grid: torch.Tensor, target_shape: Tuple[int, int]) -> torch.Tensor:
+    """Resize a base warp grid to *target_shape* (height, width)."""
+
+    target_h, target_w = map(int, target_shape)
+    if grid.ndim != 3 or grid.shape[-1] != 2:
+        raise ValueError(f"Warp grid must have shape (H, W, 2); got {tuple(grid.shape)}")
+    if grid.shape[0] == target_h and grid.shape[1] == target_w:
+        return grid
+
+    base = grid.permute(2, 0, 1).unsqueeze(0)
+    resized = F.interpolate(base, size=(target_h, target_w), mode="bilinear", align_corners=False)
+    return resized.squeeze(0).permute(1, 2, 0).contiguous()
 
 
 def _intensity_to_radar_rgb(cleaned_intensity: np.ndarray) -> np.ndarray:
@@ -488,7 +619,16 @@ def _apply_weak_label_config(cfg: Dict[str, Any]) -> HSVParams:
     return HSVParams(hue_lo=hue_lo, hue_hi=hue_hi, sat_min=sat_min, val_min=val_min)
 
 
-def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
+def _paths_dict(paths: Sequence[Optional[str]]) -> Dict[str, Optional[str]]:
+    keys = ("prev", "current", "next")
+    return {k: (v if v is None else str(v)) for k, v in zip(keys, paths)}
+
+
+def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    def _ensure_parent(path_str: Optional[str]) -> None:
+        if path_str:
+            Path(path_str).expanduser().parent.mkdir(parents=True, exist_ok=True)
+
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA device requested but CUDA is not available.")
@@ -523,53 +663,107 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
     weak_cfg = cfg.get("weak_label", {})
     hsvp = _apply_weak_label_config(weak_cfg)
 
+    fuse_mode = str(cfg.get("fuse_mode", "max"))
+    args.fuse_mode = fuse_mode
+
     if args.neighbor_minutes is None:
         args.neighbor_minutes = int(cfg.get("neighbor_minutes", NEIGHBOR_MINUTES))
 
-    # Build timestamp indices and gather neighbors
+    # Build timestamp indices and gather neighbors with strict alignment
     index_a = TimestampIndex(args.radar_a)
     index_b = TimestampIndex(args.radar_b)
-    anchor_ts = args.timestamp
-    paths_a = index_a.neighbor_triplet(anchor_ts, args.neighbor_minutes)
-    paths_b = index_b.neighbor_triplet(anchor_ts, args.neighbor_minutes)
 
-    if paths_a[1] is None and paths_b[1] is None:
-        step = max(1, args.neighbor_minutes)
-        tol_center = MIN_TOL_MINUTES
-        shifted = False
+    step = int(args.neighbor_minutes)
+    if step <= 0:
+        raise ValueError("neighbor_minutes must be positive.")
+
+    def _strict_bundle(center_ts: int) -> Optional[Tuple[List[str], List[str]]]:
+        paths_a = index_a.strict_triplet(center_ts, step)
+        if paths_a is None:
+            return None
+        paths_b = index_b.strict_triplet(center_ts, step)
+        if paths_b is None:
+            return None
+        return paths_a, paths_b
+
+    def _missing_offsets(idx: TimestampIndex, center_ts: int) -> List[Tuple[int, int]]:
+        offsets = (-step, 0, step)
+        missing: List[Tuple[int, int]] = []
+        for offset in offsets:
+            seek_ts = add_minutes(center_ts, offset)
+            if idx.ts_to_path.get(seek_ts) is None:
+                missing.append((offset, seek_ts))
+        return missing
+
+    def _format_missing(label: str, missing: Sequence[Tuple[int, int]]) -> Optional[str]:
+        if not missing:
+            return None
+        formatted = []
+        for offset, ts_val in missing:
+            dt = ts_to_dt(ts_val)
+            formatted.append(f"{offset:+d}m ({dt.strftime('%Y-%m-%d %H:%M')})")
+        return f"Radar {label} missing {', '.join(formatted)}"
+
+    anchor_ts = args.timestamp
+    bundle = _strict_bundle(anchor_ts)
+
+    if bundle is None:
+        visited = {anchor_ts}
+        found: Optional[Tuple[List[str], List[str]]] = None
         for delta in range(step, step * 5, step):
             for direction in (1, -1):
                 candidate_ts = add_minutes(anchor_ts, delta * direction)
-                has_center_a = index_a.find_within(candidate_ts, tol_center) is not None
-                has_center_b = index_b.find_within(candidate_ts, tol_center) is not None
-                if has_center_a or has_center_b:
+                if candidate_ts in visited:
+                    continue
+                visited.add(candidate_ts)
+                candidate_bundle = _strict_bundle(candidate_ts)
+                if candidate_bundle is not None:
+                    found = candidate_bundle
                     anchor_ts = candidate_ts
-                    paths_a = index_a.neighbor_triplet(anchor_ts, args.neighbor_minutes)
-                    paths_b = index_b.neighbor_triplet(anchor_ts, args.neighbor_minutes)
-                    shifted = True
+                    print(
+                        "Shifted anchor to maintain strict neighbor alignment: "
+                        f"{args.timestamp} -> {anchor_ts}"
+                    )
                     break
-            if shifted:
-                print(
-                    "Both radars missing center frame; "
-                    f"shifted anchor from {args.timestamp} to {anchor_ts}"
-                )
+            if found is not None:
                 break
+        bundle = found
+
+    if bundle is None:
+        missing_msgs = []
+        msg_a = _format_missing("A", _missing_offsets(index_a, args.timestamp))
+        msg_b = _format_missing("B", _missing_offsets(index_b, args.timestamp))
+        if msg_a:
+            missing_msgs.append(msg_a)
+        if msg_b:
+            missing_msgs.append(msg_b)
+        detail = "; ".join(missing_msgs) if missing_msgs else "no synchronized triplets located"
+        raise RuntimeError(
+            f"Unable to locate strict +/-{step} minute triplets around {args.timestamp}: {detail}."
+        )
+
+    paths_a, paths_b = bundle
 
     args.anchor_timestamp = anchor_ts
 
-    # Determine native shapes per radar
-    try:
-        shape_a = _infer_image_shape(paths_a)
-    except RuntimeError:
-        shape_a = _infer_image_shape(paths_b)
-    shape_b = _infer_image_shape(paths_b, fallback=shape_a)
+    # Load atlases and process radar channels mirroring training-time padding
+    atlas_a_raw = _load_atlas(args.atlas_a)
+    atlas_b_raw = _load_atlas(args.atlas_b)
 
-    # Load atlases if provided
-    atlas_a = _load_atlas(args.atlas_a, shape_a)
-    atlas_b = _load_atlas(args.atlas_b, shape_b)
-
-    inten_a, avail_a = _process_radar_source(paths_a, atlas_a, shape_a, hsvp, left_mask_px, device)
-    inten_b, avail_b = _process_radar_source(paths_b, atlas_b, shape_b, hsvp, left_mask_px, device)
+    (
+        inten_a,
+        avail_a,
+        shape_a,
+        base_shape_a,
+        atlas_a_fit,
+    ) = _process_radar_source(paths_a, atlas_a_raw, hsvp, left_mask_px, device)
+    (
+        inten_b,
+        avail_b,
+        shape_b,
+        base_shape_b,
+        atlas_b_fit,
+    ) = _process_radar_source(paths_b, atlas_b_raw, hsvp, left_mask_px, device)
 
     radar_a_latlon = (float(args.radar_a_lat), float(args.radar_a_lon))
     radar_b_latlon = (float(args.radar_b_lat), float(args.radar_b_lon))
@@ -578,10 +772,15 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
     center_override_a = args.radar_a_center or training_cfg.RADAR_A_CENTER_OVERRIDE
     center_override_b = args.radar_b_center or training_cfg.RADAR_B_CENTER_OVERRIDE
 
+    base_shape_a = tuple(int(x) for x in (base_shape_a or shape_a))
+    base_shape_b = tuple(int(x) for x in (base_shape_b or shape_b))
+    shape_a = tuple(int(x) for x in shape_a)
+    shape_b = tuple(int(x) for x in shape_b)
+
     warp_path = args.warp_cache_path or warp_cache_path()
-    warp_grid, warp_meta = _load_or_build_warp_grid(
-        shape_a,
-        shape_b,
+    warp_grid, warp_meta, warp_info = _load_or_build_warp_grid(
+        base_shape_a,
+        base_shape_b,
         left_mask_px,
         warp_path,
         radar_a_latlon,
@@ -591,7 +790,16 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
         center_override_a=center_override_a,
         center_override_b=center_override_b,
     )
+    if warp_info["path"] is not None:
+        warp_path = warp_info["path"]
+        args.warp_cache_path = warp_path
     warp_grid = warp_grid.to(device=device, dtype=torch.float32)
+    warp_grid = _resize_warp_grid(warp_grid, shape_a)
+    warp_meta = dict(
+        warp_meta,
+        base_shape_A=[int(base_shape_a[0]), int(base_shape_a[1])],
+        base_shape_B=[int(base_shape_b[0]), int(base_shape_b[1])],
+    )
 
     def _warp_channels(channels: List[torch.Tensor], mode: str) -> List[torch.Tensor]:
         if not channels:
@@ -620,6 +828,9 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
     all_channels.append(torch.from_numpy(sin_t).to(device=device, dtype=torch.float32))
 
     input_tensor = torch.stack(all_channels, dim=0).unsqueeze(0)
+    input_numpy: Optional[np.ndarray] = None
+    if getattr(args, "out_input", None):
+        input_numpy = input_tensor.detach().cpu().numpy()
     input_tensor = input_tensor.to(device=device).contiguous(memory_format=torch.channels_last)
 
     # Load model
@@ -637,13 +848,110 @@ def run_inference(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
     cleaned_intensity_np = cleaned_intensity.squeeze().detach().cpu().numpy()
 
     if args.out_mask:
+        _ensure_parent(args.out_mask)
         np.save(args.out_mask, prob_mask_np)
     if args.out_intensity:
+        _ensure_parent(args.out_intensity)
         np.save(args.out_intensity, cleaned_intensity_np)
     if args.out_cleaned_image:
+        _ensure_parent(args.out_cleaned_image)
         save_cleaned_image(cleaned_intensity_np, args.out_cleaned_image)
 
-    return prob_mask_np, cleaned_intensity_np
+    georef_latlon: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    if getattr(args, "out_georef", None):
+        _ensure_parent(args.out_georef)
+        georef_latlon = _build_georef_grid(
+            shape_a,
+            left_mask_px,
+            radar_a_latlon,
+            radar_a_range_km,
+            center_override=center_override_a,
+        )
+        lat_grid, lon_grid = georef_latlon
+        np.savez(args.out_georef, lat=lat_grid, lon=lon_grid)
+
+    metadata: Dict[str, Any] = {
+        "timestamp": int(args.timestamp),
+        "anchor_timestamp": int(anchor_ts),
+        "neighbor_minutes": int(args.neighbor_minutes),
+        "strict_neighbors": True,
+        "fuse_mode": fuse_mode,
+        "checkpoint": str(args.checkpoint),
+        "model_base": int(model_base),
+        "input_channels": int(in_ch),
+        "left_mask_px": int(left_mask_px),
+        "radar_a": {
+            "root": str(args.radar_a),
+            "paths": _paths_dict(paths_a),
+            "shape": [int(shape_a[0]), int(shape_a[1])],
+            "base_shape": [int(base_shape_a[0]), int(base_shape_a[1])],
+            "atlas": {
+                "path": args.atlas_a,
+                "applied": bool(atlas_a_fit is not None),
+                "coverage": float(np.mean(atlas_a_fit)) if atlas_a_fit is not None else None,
+            },
+            "latlon": list(map(float, radar_a_latlon)),
+            "range_km": float(radar_a_range_km),
+        },
+        "radar_b": {
+            "root": str(args.radar_b),
+            "paths": _paths_dict(paths_b),
+            "shape": [int(shape_b[0]), int(shape_b[1])],
+            "base_shape": [int(base_shape_b[0]), int(base_shape_b[1])],
+            "atlas": {
+                "path": args.atlas_b,
+                "applied": bool(atlas_b_fit is not None),
+                "coverage": float(np.mean(atlas_b_fit)) if atlas_b_fit is not None else None,
+            },
+            "latlon": list(map(float, radar_b_latlon)),
+            "range_km": float(radar_b_range_km),
+        },
+        "geometry": {
+            "helper_center": [float(helper_center[0]), float(helper_center[1])],
+            "meters_per_pixel": {
+                "radar_a": float(compute_mpp(base_shape_a[0], base_shape_a[1], left_mask_px, radar_a_range_km)),
+                "radar_b": float(compute_mpp(base_shape_b[0], base_shape_b[1], left_mask_px, radar_b_range_km)),
+            },
+            "warp": dict(warp_meta, **{"source": "cache" if warp_info["cache_hit"] else "computed", "path": warp_info["path"]}),
+        },
+        "warp_cache_path": warp_path,
+        "weak_label": {
+            "mode": training_cfg.WEAK_LABEL_MODE,
+            "hsv": {
+                "hue_lo": float(hsvp.hue_lo),
+                "hue_hi": float(hsvp.hue_hi),
+                "sat_min": float(hsvp.sat_min),
+                "val_min": float(hsvp.val_min),
+            },
+            "multi_ranges": [(float(lo), float(hi)) for (lo, hi) in training_cfg.HSV_MULTI_RANGES],
+        },
+    }
+
+    if georef_latlon is not None:
+        lat_grid, lon_grid = georef_latlon
+        metadata["georef"] = {
+            "crs": "EPSG:4326",
+            "lat_range": [float(lat_grid.min()), float(lat_grid.max())],
+            "lon_range": [float(lon_grid.min()), float(lon_grid.max())],
+            "shape": [int(lat_grid.shape[0]), int(lat_grid.shape[1])],
+        }
+
+    if getattr(args, "out_metadata", None):
+        _ensure_parent(args.out_metadata)
+        with open(args.out_metadata, "w", encoding="utf-8") as fh:
+            json.dump(metadata, fh, indent=2, sort_keys=True)
+
+    if input_numpy is not None and getattr(args, "out_input", None):
+        _ensure_parent(args.out_input)
+        np.save(args.out_input, input_numpy)
+
+    extras: Dict[str, Any] = {"metadata": metadata}
+    if input_numpy is not None:
+        extras["input_tensor"] = input_numpy
+    if georef_latlon is not None:
+        extras["georef"] = {"lat": georef_latlon[0], "lon": georef_latlon[1]}
+
+    return prob_mask_np, cleaned_intensity_np, extras
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -720,6 +1028,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Output image file (default: outputs/cleaned_<ts>.png) for the cleaned intensity map.",
     )
     parser.add_argument(
+        "--out-metadata",
+        help="Optional JSON file to store preprocessing and georeference metadata (default: outputs/meta_<ts>.json).",
+    )
+    parser.add_argument(
+        "--out-georef",
+        help="Optional .npz file to store 'lat' and 'lon' georeference grids (Radar A frame).",
+    )
+    parser.add_argument(
+        "--out-input",
+        help="Optional .npy file to dump the assembled 15-channel network input tensor.",
+    )
+    parser.add_argument(
         "--output-dir",
         default=str(DEFAULT_OUTPUT_DIR),
         help="Directory to place default outputs when explicit paths are not provided.",
@@ -755,8 +1075,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         args.out_intensity = str(output_dir / f"intensity_{timestamp}.npy")
     if args.out_cleaned_image is None:
         args.out_cleaned_image = str(output_dir / f"cleaned_{timestamp}.png")
+    if args.out_metadata is None:
+        args.out_metadata = str(output_dir / f"meta_{timestamp}.json")
 
-    prob_mask_np, cleaned_intensity_np = run_inference(args)
+    prob_mask_np, cleaned_intensity_np, _ = run_inference(args)
     anchor_ts = getattr(args, "anchor_timestamp", args.timestamp)
     message = (
         "Successfully generated prediction. Mask shape: "
@@ -766,6 +1088,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         message += f". Anchor timestamp adjusted to {anchor_ts}"
     if args.out_cleaned_image:
         message += f". Cleaned image saved to {args.out_cleaned_image}"
+    if args.out_metadata:
+        message += f". Metadata saved to {args.out_metadata}"
+    if args.out_georef:
+        message += f". Georeference grid saved to {args.out_georef}"
+    if args.out_input:
+        message += f". Input tensor saved to {args.out_input}"
     print(message)
 
 
